@@ -1254,8 +1254,8 @@ async function maybeUpdatePinnedSummary(session) {
   if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
 
-  // Trigger every 10 messages
-  if (session.chatHistory.length < 10 || session.chatHistory.length % 10 !== 0) return;
+  // Trigger every 5 messages
+  if (session.chatHistory.length < 5 || session.chatHistory.length % 5 !== 0) return;
 
   try {
     // Get current pinned summary content
