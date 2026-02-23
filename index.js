@@ -1291,8 +1291,8 @@ async function maybeUpdatePinnedSummary(session) {
     ).join('\n\n');
 
     const prompt = currentSummary
-      ? `Based on these 10 recent messages, provide:\n1. A 2-3 word noun phrase title (topic/feature being worked on - avoid verbs, prefer nouns like "plan mode fix" not "fixing plan mode")\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 2-3 word noun phrase title (topic/feature - avoid verbs, prefer nouns like "bridge summarization" not "adding summaries")\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+      ? `Based on these 10 recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
@@ -2374,7 +2374,7 @@ client.on('room.message', async (roomId, event) => {
             try {
               const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
               const result = await model.generateContent(
-                `Generate a 2-3 word noun phrase title for a conversation starting with this message. Use nouns, avoid verbs.\n\nMessage: ${text.slice(0, 500)}`
+                `Generate a 3-5 word title (max 34 chars) for a conversation starting with this message.\n\nMessage: ${text.slice(0, 500)}`
               );
               const title = result.response.text().trim().slice(0, 60);
               updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
