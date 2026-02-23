@@ -109,5 +109,39 @@ server.tool(
   }
 );
 
+server.tool(
+  'share_sensitive_data',
+  'CRITICAL: Use this to share ANY sensitive data (API keys, tokens, passwords, credentials) with the user via a secure viewer link instead of posting in chat. Returns a one-time secure URL. The data is NOT logged in conversation history.',
+  {
+    label: z.string().describe('Short description of the sensitive data, e.g. "Gemini API Key" or "Database Password"'),
+    content: z.string().describe('The sensitive data to share securely'),
+    ttl: z.number().optional().describe('Time-to-live in seconds (default: 3600 = 1 hour, max: 86400 = 24 hours)'),
+  },
+  async ({ label, content, ttl }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/share-sensitive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, content, ttl: ttl || 3600, roomId: ROOM_ID }),
+      });
+
+      if (!postRes.ok) {
+        const err = await postRes.text();
+        return { content: [{ type: 'text', text: `Error creating secure link: ${err}` }] };
+      }
+
+      const { url, expiresAt } = await postRes.json();
+      return {
+        content: [{
+          type: 'text',
+          text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and can only be viewed once.`
+        }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

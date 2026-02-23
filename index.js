@@ -81,6 +81,14 @@ function generateSecretLink(secretId, label, roomId) {
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
+function generateSensitiveLink(sensitiveId, label, ttl) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + ttl * 1000) / 1000);
+  const payload = Buffer.from(JSON.stringify({ sensitiveId, label, exp })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/sensitive?token=${payload}.${sig}`;
+}
+
 
 
 function debug(...args) {
@@ -2432,6 +2440,7 @@ client.on('room.join', async (roomId, event) => {
 const pendingMcpQuestions = new Map();
 let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
+const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // --- Local HTTP API ---
 
@@ -2471,6 +2480,40 @@ const apiServer = createServer((req, res) => {
     if (s.answered) {
       pendingSecrets.delete(secretId);
     }
+    return;
+  }
+
+  // GET /sensitive/:id — Viewer retrieves sensitive data (one-time view)
+  if (req.method === 'GET' && url.pathname.startsWith('/sensitive/')) {
+    const sensitiveId = url.pathname.split('/')[2];
+    const s = pendingSensitiveData.get(sensitiveId);
+    if (!s) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Sensitive data not found or already viewed' }));
+      return;
+    }
+    if (Date.now() > s.expiresAt) {
+      pendingSensitiveData.delete(sensitiveId);
+      res.writeHead(410);
+      res.end(JSON.stringify({ error: 'Sensitive data has expired' }));
+      return;
+    }
+    if (s.viewed) {
+      res.writeHead(403);
+      res.end(JSON.stringify({ error: 'Sensitive data has already been viewed (one-time link)' }));
+      return;
+    }
+
+    // Mark as viewed and return content
+    s.viewed = true;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ label: s.label, content: s.content }));
+
+    // Delete after 1 minute to allow time for the page to render, but prevent repeated access
+    setTimeout(() => {
+      pendingSensitiveData.delete(sensitiveId);
+      debug(`Cleaned up viewed sensitive data: ${sensitiveId}`);
+    }, 60000);
     return;
   }
 
@@ -2618,6 +2661,60 @@ const apiServer = createServer((req, res) => {
 
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, path: filePath }));
+        return;
+      }
+
+      if (url.pathname === '/share-sensitive') {
+        const { label, content, ttl, roomId } = data;
+        if (!label || !content) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'label and content are required' }));
+          return;
+        }
+
+        const sensitiveId = randomUUID();
+        const ttlSeconds = Math.min(Math.max(ttl || 3600, 60), 86400); // Min 1 min, max 24 hours, default 1 hour
+        const expiresAt = Date.now() + ttlSeconds * 1000;
+
+        pendingSensitiveData.set(sensitiveId, {
+          label,
+          content,
+          viewed: false,
+          expiresAt,
+        });
+
+        // Generate secure link
+        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds);
+        if (!link) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: 'Viewer not configured (missing HMAC_SECRET or VIEWER_BASE_URL)' }));
+          return;
+        }
+
+        // Send notification to user in Matrix chat
+        let activeSession = roomId ? sessions.get(roomId) : null;
+        if (!activeSession) {
+          for (const [, s] of sessions) {
+            if (s.alive) { activeSession = s; break; }
+          }
+        }
+
+        if (activeSession && activeSession.sendHtml) {
+          const plain = `🔐 Secure data: ${label} — View: ${link}`;
+          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">View</a> (one-time link, expires at ${new Date(expiresAt).toISOString()})`;
+          activeSession.sendHtml(plain, html);
+        } else if (activeSession && activeSession.sendCallback) {
+          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (one-time link, expires at ${new Date(expiresAt).toISOString()})`);
+        }
+
+        // Schedule cleanup after expiry
+        setTimeout(() => {
+          pendingSensitiveData.delete(sensitiveId);
+          debug(`Cleaned up expired sensitive data: ${sensitiveId}`);
+        }, ttlSeconds * 1000);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: link, expiresAt: new Date(expiresAt).toISOString() }));
         return;
       }
 
