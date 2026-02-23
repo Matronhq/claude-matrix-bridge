@@ -1302,9 +1302,9 @@ async function maybeUpdatePinnedSummary(session) {
 
     const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
 
-    // Update room name (keep short - UI truncates around 30 chars)
+    // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 30)}`;
+      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 60)}`;
       updateRoomName(session.roomId, name);
     }
 
@@ -2344,7 +2344,7 @@ client.on('room.message', async (roomId, event) => {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 30)}`;
+        const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 60)}`;
         updateRoomName(session.roomId, label);
       }
     } catch (err) {
@@ -2376,17 +2376,17 @@ client.on('room.message', async (roomId, event) => {
               const result = await model.generateContent(
                 `Generate a 2-3 word noun phrase title for a conversation starting with this message. Use nouns, avoid verbs.\n\nMessage: ${text.slice(0, 500)}`
               );
-              const title = result.response.text().trim().slice(0, 30);
+              const title = result.response.text().trim().slice(0, 60);
               updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
             } catch (e) {
               // Fallback to first message if Gemini fails
-              const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+              const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
               updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
             }
           })();
         } else {
           // No Gemini configured - use first message
-          const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+          const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
           updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
         }
       }
