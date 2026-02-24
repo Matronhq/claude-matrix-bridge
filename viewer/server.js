@@ -134,6 +134,55 @@ function renderSecretSuccess() {
 </html>`;
 }
 
+function renderSensitiveData(label, content) {
+  const escaped = content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const labelEscaped = label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${labelEscaped}</title>
+  <style>
+    body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px; }
+    .header { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
+    .label { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+    .warning { color: #f85149; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .content { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; position: relative; }
+    .content pre { margin: 0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
+    .copy-btn { position: absolute; top: 12px; right: 12px; padding: 6px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; }
+    .copy-btn:hover { background: #2ea043; }
+    .copy-btn.copied { background: #1f6feb; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="label">🔐 ${labelEscaped}</div>
+    <div class="warning">⚠️ This is a one-time link. Once you close this page, the data will be permanently deleted.</div>
+  </div>
+  <div class="content">
+    <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
+    <pre id="content">${escaped}</pre>
+  </div>
+  <script>
+    function copyToClipboard() {
+      const content = document.getElementById('content').textContent;
+      navigator.clipboard.writeText(content).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>`;
+}
+
 app.get('/view', async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
@@ -243,6 +292,33 @@ app.post('/secret', async (req, res) => {
     res.type('html').send(renderSecretSuccess());
   } catch (err) {
     console.error('Secret submit proxy error:', err);
+    res.status(500).send('Failed to reach bridge API');
+  }
+});
+
+app.get('/sensitive', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
+  if (!data.sensitiveId || !data.label) return res.status(400).send('Invalid sensitive data token');
+
+  try {
+    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      const safeErr = (err.error || 'Unknown error').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return res.status(resp.status).type('html').send(
+        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title><style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{text-align:center;padding:40px;}h2{color:#f85149;}</style></head><body><div class="card"><h2>⚠️ Error</h2><p>${safeErr}</p></div></body></html>`
+      );
+    }
+
+    const { label, content } = await resp.json();
+    res.type('html').send(renderSensitiveData(label, content));
+  } catch (err) {
+    console.error('Sensitive data fetch error:', err);
     res.status(500).send('Failed to reach bridge API');
   }
 });

@@ -81,6 +81,14 @@ function generateSecretLink(secretId, label, roomId) {
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
+function generateSensitiveLink(sensitiveId, label, ttl) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + ttl * 1000) / 1000);
+  const payload = Buffer.from(JSON.stringify({ sensitiveId, label, exp })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/sensitive?token=${payload}.${sig}`;
+}
+
 
 
 function debug(...args) {
@@ -133,7 +141,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.',
+    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.\n\nCRITICAL SECURITY REQUIREMENT - Sensitive Data Handling:\nNEVER post sensitive data (API keys, tokens, passwords, credentials, secrets, private keys, connection strings, etc.) directly in chat messages. You MUST use the mcp__ask-user__share_sensitive_data tool instead. This tool creates a secure one-time viewer link that:\n- Is only viewable once\n- Expires after a configurable time (default 1 hour)\n- Is NOT logged in conversation history\n- Cannot be accidentally exposed or copied from chat\n\nBefore posting ANY data that could be sensitive, ask yourself:\n1. Could this be used to authenticate or authorize access?\n2. Would exposure of this data create a security risk?\n3. Should this data be kept private?\n\nIf the answer to ANY of these is "yes", you MUST use mcp__ask-user__share_sensitive_data instead of posting in chat.\n\nExamples of data that MUST use share_sensitive_data:\n- API keys, access tokens, auth tokens\n- Passwords, passphrases, PINs\n- Private keys, certificates, secrets\n- Database connection strings with credentials\n- OAuth client secrets\n- Webhook secrets, signing keys\n- Any credential or secret value\n\nThis is a BLOCKING REQUIREMENT. Failure to use share_sensitive_data for sensitive data is a critical security violation.',
     '--include-partial-messages',
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
@@ -160,6 +168,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     env: {
       ...process.env,
       CLAUDECODE: '',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
       MATRIX_BRIDGE_API_PORT: String(API_PORT),
     },
@@ -1376,6 +1385,36 @@ function getSessionSummary(sessionId, workdir) {
   return '';
 }
 
+/**
+ * Check if the session's JSONL history already contains a tool_result for the given tool_use_id.
+ * This prevents sending duplicate tool_results which cause API 400 errors.
+ */
+function hasToolResultInHistory(sessionId, workdir, toolUseId) {
+  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+    // Scan from end (most recent) for efficiency
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      // Quick string check before parsing JSON
+      if (!line.includes(toolUseId)) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (record.type === 'user' && Array.isArray(record.message?.content)) {
+        for (const block of record.message.content) {
+          if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
+            return true;
+          }
+        }
+      }
+    }
+  } catch {}
+  return false;
+}
+
 // --- Media Handling ---
 
 async function downloadMatrixFile(mxcUrl, fileInfo) {
@@ -1473,7 +1512,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const arg = parts[1];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
-      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
+      let workdir = DEFAULT_WORKDIR;
+      if (explicitWorkdir) {
+        const resolved = path.resolve(explicitWorkdir);
+        try {
+          const stat = fs.statSync(resolved);
+          if (!stat.isDirectory()) {
+            await sendReply(`Not a directory: ${resolved}`);
+            return;
+          }
+        } catch {
+          await sendReply(`Directory not accessible: ${resolved}`);
+          return;
+        }
+        workdir = resolved;
+      }
 
       // Create a new room for this session
       let sessionRoomId;
@@ -1542,6 +1595,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       restarted.originRoomId = existing.originRoomId;
       restarted.firstMessageCaptured = existing.firstMessageCaptured;
+      // Persist immediately so auto-resume works if the bridge restarts
+      if (restartSessionId) {
+        persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
+      }
       await sendReply(
         `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
       );
@@ -1562,7 +1619,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const resumeWorkdir = DEFAULT_WORKDIR;
+      const currentSession = sessions.get(roomId);
+      const prev = getPersistedSession(roomId);
+      const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
@@ -1581,6 +1640,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         });
 
       let resumeSessionId;
+      let actualWorkdir = resumeWorkdir;
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
       if (!isNaN(num) && num >= 1 && num <= files.length) {
         resumeSessionId = files[num - 1];
@@ -1589,8 +1649,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (match) {
           resumeSessionId = match;
         } else {
-          await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
-          return;
+          // Session not found in current workdir — check persisted sessions for a different workdir
+          const allPersisted = loadPersistedSessions();
+          let foundEntry = null;
+          for (const entry of Object.values(allPersisted)) {
+            if (entry.sessionId && entry.sessionId.startsWith(resumeArg) && entry.workdir && entry.workdir !== resumeWorkdir) {
+              foundEntry = entry;
+              break;
+            }
+          }
+          if (foundEntry) {
+            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+            const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
+            const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
+            if (fs.existsSync(altFile)) {
+              resumeSessionId = foundEntry.sessionId;
+              actualWorkdir = foundEntry.workdir;
+            }
+          }
+          if (!resumeSessionId) {
+            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+            return;
+          }
         }
       }
 
@@ -1614,7 +1694,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const shortId = resumeSessionId.slice(0, 8);
-      const summary = getSessionSummary(resumeSessionId, resumeWorkdir);
+      const summary = getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
@@ -1625,7 +1705,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId);
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
@@ -1633,14 +1713,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendButtonMessage = sessionSendButtons;
 
       // Persist immediately — we already know the session ID, don't wait for Claude's event
-      persistSession(sessionRoomId, resumeSessionId, resumeWorkdir, roomId);
+      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
-      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(resumeWorkdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -2167,13 +2247,30 @@ client.on('room.message', async (roomId, event) => {
   // Handle text "build" for plan approval
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
   if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
-    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${session.pendingPlanDenialId}`);
-    if (session.pendingPlanDenialId) {
-      // Send a tool_result to properly exit plan mode
-      const toolUseId = session.pendingPlanDenialId;
+    const toolUseId = session.pendingPlanDenialId;
+    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+
+    // Check if a tool_result already exists in the session history for this tool_use_id.
+    // Claude CLI auto-generates a tool_result for permission denials, so sending another
+    // one causes a duplicate tool_result API 400 error.
+    const alreadyAnswered = toolUseId && session.claudeSessionId
+      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+      : false;
+    console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
+
+    if (!toolUseId || alreadyAnswered) {
+      // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
       session.pendingPlan = null;
       session.pendingPlanDenialId = null;
-      // Clear persisted denial ID
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    } else {
+      // No existing tool_result — send tool_result to properly exit plan mode
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
       if (session.claudeSessionId) {
         persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
       }
@@ -2200,10 +2297,6 @@ client.on('room.message', async (roomId, event) => {
       if (session.resetTimeout) session.resetTimeout();
       if (session.typingInterval) clearInterval(session.typingInterval);
       session.typingInterval = startTyping(session.roomId);
-    } else {
-      // Fallback: send as text
-      sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
-      session.pendingPlan = null;
     }
     const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
     await sendHtmlFn(buildNotice.plain, buildNotice.html);
@@ -2432,12 +2525,13 @@ client.on('room.join', async (roomId, event) => {
 const pendingMcpQuestions = new Map();
 let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
+const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // --- Local HTTP API ---
 
 const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
 
-const apiServer = createServer((req, res) => {
+const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
   // GET /ask/:id — MCP server polls for answer
@@ -2474,6 +2568,40 @@ const apiServer = createServer((req, res) => {
     return;
   }
 
+  // GET /sensitive/:id — Viewer retrieves sensitive data (one-time view)
+  if (req.method === 'GET' && url.pathname.startsWith('/sensitive/')) {
+    const sensitiveId = url.pathname.split('/')[2];
+    const s = pendingSensitiveData.get(sensitiveId);
+    if (!s) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Sensitive data not found or already viewed' }));
+      return;
+    }
+    if (Date.now() > s.expiresAt) {
+      pendingSensitiveData.delete(sensitiveId);
+      res.writeHead(410);
+      res.end(JSON.stringify({ error: 'Sensitive data has expired' }));
+      return;
+    }
+    if (s.viewed) {
+      res.writeHead(403);
+      res.end(JSON.stringify({ error: 'Sensitive data has already been viewed (one-time link)' }));
+      return;
+    }
+
+    // Mark as viewed and return content
+    s.viewed = true;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ label: s.label, content: s.content }));
+
+    // Delete after 1 minute to allow time for the page to render, but prevent repeated access
+    setTimeout(() => {
+      pendingSensitiveData.delete(sensitiveId);
+      debug(`Cleaned up viewed sensitive data: ${sensitiveId}`);
+    }, 60000);
+    return;
+  }
+
   if (req.method !== 'POST') {
     res.writeHead(405);
     res.end('Method not allowed');
@@ -2482,16 +2610,16 @@ const apiServer = createServer((req, res) => {
 
   let body = '';
   req.on('data', chunk => body += chunk);
-  req.on('end', () => {
+  req.on('end', async () => {
     try {
       const data = JSON.parse(body);
 
       // POST /ask — MCP server posts a question
       if (url.pathname === '/ask') {
         const { question, header, options, multiSelect, roomId } = data;
-        if (!question) {
+        if (!question || !roomId) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'question is required' }));
+          res.end(JSON.stringify({ error: 'question and roomId are required' }));
           return;
         }
 
@@ -2502,13 +2630,7 @@ const apiServer = createServer((req, res) => {
           answered: false, answer: null,
         });
 
-        // Find the session — prefer the specific room, fall back to first alive
-        let activeSession = roomId ? sessions.get(roomId) : null;
-        if (!activeSession) {
-          for (const [, s] of sessions) {
-            if (s.alive) { activeSession = s; break; }
-          }
-        }
+        const activeSession = sessions.get(roomId);
 
         if (activeSession) {
           const parsed = {
@@ -2543,9 +2665,9 @@ const apiServer = createServer((req, res) => {
 
       if (url.pathname === '/secret') {
         const { label, roomId } = data;
-        if (!label) {
+        if (!label || !roomId) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'label is required' }));
+          res.end(JSON.stringify({ error: 'label and roomId are required' }));
           return;
         }
 
@@ -2557,13 +2679,7 @@ const apiServer = createServer((req, res) => {
           path: null,
         });
 
-        // Find the session — prefer the specific room, fall back to first alive
-        let activeSession = roomId ? sessions.get(roomId) : null;
-        if (!activeSession) {
-          for (const [, s] of sessions) {
-            if (s.alive) { activeSession = s; break; }
-          }
-        }
+        const activeSession = sessions.get(roomId);
 
         if (activeSession) {
           const link = generateSecretLink(secretId, label, activeSession.roomId);
@@ -2618,6 +2734,75 @@ const apiServer = createServer((req, res) => {
 
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, path: filePath }));
+        return;
+      }
+
+      if (url.pathname === '/share-sensitive') {
+        const { label, content, ttl, roomId } = data;
+        if (!label || !content || !roomId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'label, content, and roomId are required' }));
+          return;
+        }
+
+        const sensitiveId = randomUUID();
+        const ttlSeconds = Math.min(Math.max(ttl || 3600, 60), 86400); // Min 1 min, max 24 hours, default 1 hour
+        const expiresAt = Date.now() + ttlSeconds * 1000;
+
+        // Generate secure link before storing data — if viewer is misconfigured, don't leak sensitive content in memory
+        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds);
+        if (!link) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: 'Viewer not configured (missing HMAC_SECRET or VIEWER_BASE_URL)' }));
+          return;
+        }
+
+        pendingSensitiveData.set(sensitiveId, {
+          label,
+          content,
+          viewed: false,
+          expiresAt,
+        });
+
+        // Send notification to user in Matrix chat
+        const activeSession = sessions.get(roomId);
+
+        if (activeSession && activeSession.sendHtml) {
+          const plain = `🔐 Secure data: ${label} — View: ${link}`;
+          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">View</a> (one-time link, expires at ${new Date(expiresAt).toISOString()})`;
+          activeSession.sendHtml(plain, html);
+        } else if (activeSession && activeSession.sendCallback) {
+          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (one-time link, expires at ${new Date(expiresAt).toISOString()})`);
+        }
+
+        // Schedule cleanup after expiry
+        setTimeout(() => {
+          pendingSensitiveData.delete(sensitiveId);
+          debug(`Cleaned up expired sensitive data: ${sensitiveId}`);
+        }, ttlSeconds * 1000);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: link, expiresAt: new Date(expiresAt).toISOString() }));
+        return;
+      }
+
+      if (url.pathname === '/redact-message') {
+        const { roomId, eventId, reason } = data;
+        if (!roomId || !eventId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and eventId are required' }));
+          return;
+        }
+
+        try {
+          await client.redactEvent(roomId, eventId, reason || 'Message redacted by bridge');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          debug(`Failed to redact message: ${err.message}`);
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: `Failed to redact message: ${err.message}` }));
+        }
         return;
       }
 
