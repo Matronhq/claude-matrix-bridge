@@ -111,11 +111,14 @@ function loadLastEventTsMap() {
 
 let lastEventTsMap = loadLastEventTsMap();
 let lastEventTsDirty = false;
+const botStartupTs = Date.now();
 
 function saveLastEventTsMap() {
   if (!lastEventTsDirty) return;
-  try { fs.writeFileSync(LAST_EVENT_TS_FILE, JSON.stringify(lastEventTsMap)); } catch {}
-  lastEventTsDirty = false;
+  try {
+    fs.writeFileSync(LAST_EVENT_TS_FILE, JSON.stringify(lastEventTsMap));
+    lastEventTsDirty = false;
+  } catch {}
 }
 
 // Flush per-room timestamps periodically rather than on every event
@@ -2134,15 +2137,19 @@ client.on('room.message', async (roomId, event) => {
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
   // Skip events we already processed before a restart (per-room tracking).
-  // Events sent during downtime have a newer timestamp and will be processed normally.
+  // Only apply dedup for events that predate bot startup — these are sync replays.
+  // Events newer than startup can't be replays and are always processed, even if
+  // federated clock skew makes their timestamp slightly out of order.
   const eventTs = event.origin_server_ts || 0;
   const roomLastTs = lastEventTsMap[roomId] || 0;
-  if (eventTs <= roomLastTs) {
+  if (eventTs < botStartupTs && eventTs <= roomLastTs) {
     debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${roomLastTs})`);
     return;
   }
-  lastEventTsMap[roomId] = eventTs;
-  lastEventTsDirty = true;
+  if (eventTs > roomLastTs) {
+    lastEventTsMap[roomId] = eventTs;
+    lastEventTsDirty = true;
+  }
 
   const sender = event.sender;
   if (!isAllowed(sender)) return;
