@@ -10,7 +10,7 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 - Node.js 20+
 - Claude Code CLI installed and authenticated
-- A Matrix homeserver (e.g. Tuwunel) with a bot account
+- A Matrix homeserver, such as [matron-server](https://github.com/matronhq/matron-server), Matron's branch of Tuwunel, with a bot account
 
 ## Setup
 
