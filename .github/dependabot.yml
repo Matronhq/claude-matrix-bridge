@@ -19,6 +19,7 @@ updates:
       # Keep Dependabot active, but expect this family to need upstream work.
       - dependency-name: request
       - dependency-name: request-promise
+      - dependency-name: uuid
 
   - package-ecosystem: github-actions
     directory: /
