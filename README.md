@@ -2,6 +2,10 @@
 
 Bridge Matrix messages directly to Claude Code CLI sessions. Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping. E2E encrypted via Matrix.
 
+## License
+
+This project is licensed under AGPLv3. For alternative licensing, contact [licensing@matron.chat](mailto:licensing@matron.chat).
+
 ## Requirements
 
 - Node.js 20+
