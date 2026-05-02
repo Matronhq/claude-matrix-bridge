@@ -12,7 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
-import { generateSignedUrl } from './viewer/server.js';
+import { generateSignedUrl } from './lib/viewer-tokens.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -27,7 +27,7 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .map(id => id.trim())
   .filter(Boolean);
 
-const DEFAULT_WORKDIR = process.env.DEFAULT_WORKDIR || process.cwd();
+const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
 const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
@@ -1360,10 +1360,10 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
     body,
     format: 'org.matrix.custom.html',
     formatted_body,
-    'com.matron.live_output': { tool_use_id, command, viewer_url, expires_at },
+    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command, viewer_url, expires_at },
   };
   try {
-    await client.sendEvent(session.roomId, 'com.matron.live_output.v1', content);
+    await client.sendEvent(session.roomId, `${MATRIX_EVENT_NAMESPACE}.live_output.v1`, content);
   } catch (e) {
     console.error('Failed to send live_output event:', e.message);
   }
@@ -1376,7 +1376,7 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
     body: fallbackBody,
     format: 'org.matrix.custom.html',
     formatted_body: fallbackHtml,
-    'com.yearbook.buttons': {
+    [`${MATRIX_EVENT_NAMESPACE}.buttons`]: {
       mode,       // 'pick_one' or 'pick_many'
       prompt,
       buttons,    // [{ id, label, value }]
@@ -1393,7 +1393,10 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 
 // --- Room Management ---
 
-const YEARBOOK_COMMANDS = [
+const MATRIX_EVENT_NAMESPACE = 'com.matron';
+const LEGACY_MATRIX_EVENT_NAMESPACE = 'com.yearbook';
+
+const MATRON_COMMANDS = [
   { command: 'start', args: '[workdir]', description: 'Start a new session' },
   { command: 'stop', description: 'Stop the current session' },
   { command: 'restart', description: 'Stop and immediately resume' },
@@ -1418,9 +1421,9 @@ async function createSessionRoom(inviteUserId) {
       content: { algorithm: 'm.megolm.v1.aes-sha2' },
     }] : []),
     {
-      type: 'com.yearbook.commands',
+      type: `${MATRIX_EVENT_NAMESPACE}.commands`,
       state_key: '',
-      content: { commands: YEARBOOK_COMMANDS },
+      content: { commands: MATRON_COMMANDS },
     },
   ];
 
@@ -2450,10 +2453,11 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
-  if (event.content['com.yearbook.button_response']) {
-    const responseData = event.content['com.yearbook.button_response'];
-    const selectedValues = (typeof responseData === 'object' && Array.isArray(responseData.selected_values))
-      ? responseData.selected_values
+  const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`]
+    || event.content[`${LEGACY_MATRIX_EVENT_NAMESPACE}.button_response`];
+  if (buttonResponse) {
+    const selectedValues = (typeof buttonResponse === 'object' && Array.isArray(buttonResponse.selected_values))
+      ? buttonResponse.selected_values
       : null;
     // Use structured values if available, fall back to body
     const value = selectedValues ? selectedValues.join(', ') : (event.content.body || '').trim();
@@ -3267,24 +3271,24 @@ async function main() {
   await client.start();
   console.log('Matrix client started, listening for messages...');
 
-  // Ensure all joined rooms have the com.yearbook.commands state event (only if changed)
+  // Ensure all joined rooms have the Matron command state event (only if changed)
   try {
     const rooms = await client.getJoinedRooms();
-    const newCommandsJson = JSON.stringify({ commands: YEARBOOK_COMMANDS });
+    const newCommandsJson = JSON.stringify({ commands: MATRON_COMMANDS });
     let updated = 0;
     for (const roomId of rooms) {
       try {
-        const existing = await client.getRoomStateEvent(roomId, 'com.yearbook.commands', '');
+        const existing = await client.getRoomStateEvent(roomId, `${MATRIX_EVENT_NAMESPACE}.commands`, '');
         if (JSON.stringify(existing) === newCommandsJson) continue;
       } catch { /* state event doesn't exist yet */ }
       try {
-        await client.sendStateEvent(roomId, 'com.yearbook.commands', '', { commands: YEARBOOK_COMMANDS });
+        await client.sendStateEvent(roomId, `${MATRIX_EVENT_NAMESPACE}.commands`, '', { commands: MATRON_COMMANDS });
         updated++;
       } catch (e) {
         debug(`Could not set commands state in ${roomId}: ${e.message}`);
       }
     }
-    console.log(`Checked com.yearbook.commands in ${rooms.length} rooms (updated ${updated})`);
+    console.log(`Checked ${MATRIX_EVENT_NAMESPACE}.commands in ${rooms.length} rooms (updated ${updated})`);
   } catch (e) {
     console.error('Failed to update command state events:', e.message);
   }
