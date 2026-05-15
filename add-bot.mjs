@@ -237,7 +237,11 @@ async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: request.body,
   });
-  const result = await uploadResp.json();
+  const uploadBody = await uploadResp.text();
+  if (!uploadResp.ok) {
+    throw new Error(`signatures/upload returned HTTP ${uploadResp.status}: ${uploadBody.slice(0, 500)}`);
+  }
+  const result = JSON.parse(uploadBody);
   const failures = result.failures || {};
   if (Object.keys(failures).length > 0) {
     throw new Error('signatures/upload failures: ' + JSON.stringify(failures));
@@ -252,7 +256,11 @@ async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ device_keys: { [userId]: [] } }),
   });
-  await cryptoApi.olmMachine.markRequestAsSent('post-cross-sign-keys-query', 1, JSON.stringify(await queryResp.json()));
+  const queryBody = await queryResp.text();
+  if (!queryResp.ok) {
+    throw new Error(`keys/query returned HTTP ${queryResp.status}: ${queryBody.slice(0, 500)}`);
+  }
+  await cryptoApi.olmMachine.markRequestAsSent('post-cross-sign-keys-query', 1, queryBody);
 }
 
 async function sendVerificationAndAwait(client, cryptoApi, userId, accessToken) {
