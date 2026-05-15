@@ -485,8 +485,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
 
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
-    // Task 4.3 wires this through to Matrix.
     session.pendingInteractivePrompt = prompt;
+    handleInteractivePrompt(session, prompt);
   });
 
   iv.on('parseError', err => {
@@ -529,15 +529,101 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
 
   session.resetTimeout = () => {};
 
-  // Hook handler stubs — Task 4.2/4.3 fill these in. Defining them here so the
-  // /turn-end and /plan-decision HTTP endpoints find a callable method.
   session.onTurnEnd = () => {
     session.busy = false;
     if (session.typingInterval) { clearInterval(session.typingInterval); session.typingInterval = null; }
   };
 
+  // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
+  // fires. We post the plan to Matrix and stash the tool_use_id so that
+  // the "build" handler in the message loop can call
+  // pendingPlanDecisions.get(toolUseId).resolve(...) when the user replies.
+  session.requestPlanDecision = (toolUseId, planText) => {
+    session.ivPendingPlanToolUseId = toolUseId;
+    session.pendingPlan = planText || '';
+    const preview = (planText || '').length > 500
+      ? (planText || '').slice(0, 500) + '…'
+      : (planText || '');
+    const plainPlan = `--- Plan Ready ---\n\n${preview}\n\nReply "build" to execute, or send feedback.`;
+    if (session.sendHtml) {
+      const htmlPlan =
+        `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
+        `Reply <code>build</code> to execute, or send feedback.`;
+      session.sendHtml(plainPlan, htmlPlan);
+    } else if (session.sendCallback) {
+      session.sendCallback(plainPlan);
+    } else {
+      // No Matrix output channel yet — auto-deny so the hook unblocks.
+      const pending = pendingPlanDecisions.get(toolUseId);
+      if (pending) pending.resolve({ decision: 'deny', reason: 'no Matrix output channel for session' });
+    }
+  };
+
   sessions.set(roomId, session);
   return session;
+}
+
+// Surface a detected TUI prompt to Matrix as a multiple-choice question.
+function handleInteractivePrompt(session, prompt) {
+  if (!session.sendHtml && !session.sendCallback) return;
+  const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
+  const plain = [
+    'Claude is asking:',
+    prompt.question || '',
+    '',
+    ...optionLines,
+    '',
+    `Reply with the option number (1–${prompt.options.length})${prompt.kind === 'yes-no' ? ' or "y" / "n"' : ''}.`,
+  ].filter(Boolean).join('\n');
+  if (session.sendHtml) {
+    const htmlOptions = prompt.options.map((opt, i) =>
+      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}`
+    ).join('<br/>');
+    const html =
+      `<b>🟡 Claude is asking:</b><br/>` +
+      (prompt.question ? `<i>${escapeHtml(prompt.question)}</i><br/><br/>` : '') +
+      htmlOptions +
+      `<br/><br/>Reply with the option number (1–${prompt.options.length})` +
+      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') + '.';
+    session.sendHtml(plain, html);
+  } else {
+    session.sendCallback(plain);
+  }
+}
+
+// If the session has a pending TUI prompt and the user's message looks like
+// a valid response, send the keystroke and return true (so the message isn't
+// also forwarded to claude as a regular user message).
+function maybeResolveInteractivePrompt(session, userText) {
+  const p = session.pendingInteractivePrompt;
+  if (!p) return false;
+  const trimmed = (userText || '').trim().toLowerCase();
+  let response = null;
+  if (p.kind === 'yes-no') {
+    if (/^(y|yes|1)$/.test(trimmed)) response = { kind: 'yes-no', key: 'y' };
+    else if (/^(n|no|2)$/.test(trimmed)) response = { kind: 'yes-no', key: 'n' };
+  } else {
+    const n = parseInt(trimmed, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
+      const opt = p.options[n - 1];
+      if (p.kind === 'arrow-menu') {
+        response = { kind: 'arrow-menu', key: String(n - 1) };
+      } else {
+        response = { kind: p.kind, key: opt.key };
+      }
+    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
+      response = { kind: 'lettered', key: trimmed };
+    }
+  }
+  if (!response) {
+    const help = `Reply not understood. Please answer with the option number (1–${p.options.length}).`;
+    if (session.sendHtml) session.sendHtml(help, null);
+    else if (session.sendCallback) session.sendCallback(help);
+    return true; // consumed — invalid format, but don't forward to claude
+  }
+  session.pendingInteractivePrompt = null;
+  session.iv.respondToPrompt(response);
+  return true;
 }
 
 // --- Structured Question Handling ---
@@ -2654,6 +2740,12 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
+  // iv-mode: route reply to a pending TUI prompt before treating it as a
+  // normal message. If we consumed it as a prompt response, return.
+  if (session.iv && maybeResolveInteractivePrompt(session, text)) {
+    return;
+  }
+
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
   const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (buttonResponse) {
@@ -2725,7 +2817,7 @@ client.on('room.message', async (roomId, event) => {
 
   // Handle text "build" for plan approval
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
+  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId)) {
     const toolUseId = session.pendingPlanDenialId;
     console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
 
