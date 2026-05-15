@@ -215,6 +215,17 @@ async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
   if (Object.keys(failures).length > 0) {
     throw new Error('signatures/upload failures: ' + JSON.stringify(failures));
   }
+
+  // The signature is now on the server but our local olm machine won't
+  // know about it until we re-query the user's keys and feed the
+  // response back in. Without this refresh, getUserVerificationStatus
+  // immediately afterwards still returns the pre-upload state.
+  const queryResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/query`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_keys: { [userId]: [] } }),
+  });
+  await cryptoApi.olmMachine.markRequestAsSent('post-cross-sign-keys-query', 1, JSON.stringify(await queryResp.json()));
 }
 
 async function sendVerificationAndAwait(client, cryptoApi, userId, accessToken) {
@@ -326,8 +337,13 @@ async function main() {
       await crossSignUserFromBot(session.cryptoApi, user, session.loginData.access_token);
       log(`  ${user} master key signed by bot user-signing key`);
 
-      const status = await session.cryptoApi.getUserVerificationStatus(user);
-      if (!status.isCrossSigningVerified()) {
+      let crossVerified = false;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const status = await session.cryptoApi.getUserVerificationStatus(user);
+        if (status.isCrossSigningVerified()) { crossVerified = true; break; }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      if (!crossVerified) {
         throw new Error(`Bot still does not see ${user} as cross-verified after explicit signature upload`);
       }
     }
