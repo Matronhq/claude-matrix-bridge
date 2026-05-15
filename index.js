@@ -2840,6 +2840,13 @@ let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
+// Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
+// requests waiting for a user decision in interactive mode. The hook script
+// (hooks/exit-plan-decision.sh) holds an HTTP request open against
+// /plan-decision; the bridge resolves it once the user replies on Matrix.
+// Phase 4 wires the session-side handler that actually surfaces the plan.
+const pendingPlanDecisions = new Map();
+
 // --- Local HTTP API ---
 
 const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
@@ -3248,6 +3255,77 @@ const apiServer = createServer(async (req, res) => {
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/turn-end') {
+        // Stop hook (hooks/stop-notify.sh) — fires when an assistant turn
+        // completes. Used in interactive mode to clear typing indicators and
+        // flush response state in lieu of the stream-json `result` event.
+        const { session_id } = data;
+        let target = null;
+        if (session_id) {
+          for (const [, s] of sessions) {
+            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
+          }
+        }
+        if (target && typeof target.onTurnEnd === 'function') {
+          try { target.onTurnEnd(); } catch (e) { debug('onTurnEnd handler threw:', e?.message); }
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/plan-decision') {
+        // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude
+        // calls ExitPlanMode. Blocks until the user decides via Matrix.
+        const { session_id, tool_use_id, plan } = data;
+        if (!tool_use_id) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'tool_use_id required' }));
+          return;
+        }
+        let target = null;
+        if (session_id) {
+          for (const [, s] of sessions) {
+            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
+          }
+        }
+        if (!target) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'unknown session' }));
+          return;
+        }
+        if (typeof target.requestPlanDecision !== 'function') {
+          // Session has no plan-decision handler — this is the print-mode path
+          // (Phase 4 adds the iv-mode handler). Deny so we never silently
+          // execute an unreviewed plan.
+          res.writeHead(503);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'no plan-decision handler for session' }));
+          return;
+        }
+        // Hold the response. Timer caps the wait under curl's 1800s ceiling
+        // in exit-plan-decision.sh so we always reply before curl times out.
+        const PLAN_DECISION_TIMEOUT_MS = 1740 * 1000;
+        const timer = setTimeout(() => {
+          if (!pendingPlanDecisions.has(tool_use_id)) return;
+          pendingPlanDecisions.delete(tool_use_id);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
+        }, PLAN_DECISION_TIMEOUT_MS);
+        pendingPlanDecisions.set(tool_use_id, {
+          resolve: ({ decision, reason }) => {
+            clearTimeout(timer);
+            pendingPlanDecisions.delete(tool_use_id);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ decision: decision || 'deny', reason: reason || '' }));
+          },
+          plan,
+        });
+        try {
+          target.requestPlanDecision(tool_use_id, plan);
+        } catch (e) {
+          // If the handler throws, resolve with deny so the hook unblocks.
+          const pending = pendingPlanDecisions.get(tool_use_id);
+          if (pending) pending.resolve({ decision: 'deny', reason: `session handler threw: ${e?.message || e}` });
+        }
 
       } else if (url.pathname === '/sessions') {
         const list = [];
