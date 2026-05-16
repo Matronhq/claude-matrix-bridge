@@ -729,18 +729,11 @@ function maybeResolveInteractivePrompt(session, userText) {
   return true;
 }
 
-// Lines of claude TUI chrome that add no value when we surface a free-
-// text screen to Matrix: the status footer ("⏵⏵ bypass permissions on
-// · 1 shell · esc to interrupt"), separator bars, OSC window-title leaks
-// (`0;⠐ New project setup`), the bare input cursor (`❯` on its own),
-// task-list status lines, and lone spinner glyphs. Anything that's
-// actually useful (the question text, URLs, "Press Enter" cues,
-// "Logged in as X" results) is preserved.
-const TUI_CHROME_RE = /^(?:[─━—=_]{4,}|⏵⏵\s|◉|◼|◯|✻|✶|✽|✢|◆|❯\s*$|❯$|\*$|·$|\d+\s*tasks?\s+\(.*\)|0;|\[\d|✔\s|⠐|⠂|⠈|⠁|⠉|⠋|⠓|⠞|⠦|⠴|⠲|⠳|⠷|⠶|⠧|⠇|⠏|.*\bshift\+tab\b.*cycle.*|.*\besc\b\s+to\s+(?:cancel|interrupt).*)/i;
-
-function isTuiChromeLine(line) {
-  if (!line) return true;
-  return TUI_CHROME_RE.test(line);
+// Extract all URLs from a piece of text. Used by the free-text TUI
+// surface logic to pull the OAuth URL out of an un-wrapped screen.
+const URL_GLOBAL_RE = /https?:\/\/[^\s<>"')\]}]+/g;
+function extractAllUrls(text) {
+  return [...new Set(text.match(URL_GLOBAL_RE) || [])];
 }
 
 // Iteratively rejoin URLs that claude wrapped at terminal width. We only
@@ -756,6 +749,55 @@ function unwrapUrls(text) {
     out = out.replace(URL_HEAD, '$1$2');
   } while (out !== prev);
   return out;
+}
+
+// Build a clean, purpose-built Matrix message from a settled free-text
+// TUI screen instead of dumping the raw PTY content. Each cue type
+// (OAuth flow, press-enter ack, etc) gets its own formatter so the user
+// sees a focused message — no separator bars, status chrome, OSC title
+// leaks, spinner ticks, task lists, etc. Returns null when nothing
+// useful can be extracted (caller should not send anything in that
+// case rather than dumping the raw screen).
+function formatTuiCueMessage(screen, urls) {
+  // OAuth / "open this URL to sign in" flow. Triggered by /login.
+  // Screen layout: "Browser didn't open? Use the url below to sign in
+  // (c to copy)" + URL + "Paste code here if prompted >".
+  const isOauth = /browser\s+didn'?t\s+open|use\s+the\s+url|copy\s+the\s+url|paste\s+code\s+here/i.test(screen);
+  if (isOauth && urls.length > 0) {
+    const url = urls[0];
+    const plain =
+      `🔗 Claude needs you to sign in.\n\n` +
+      `Open this URL in your browser:\n${url}\n\n` +
+      `After authorising, paste the code (the long string after \`#\` in the callback URL) back here.`;
+    const html =
+      `<b>🔗 Claude needs you to sign in.</b><br/><br/>` +
+      `Open this URL in your browser:<br/>` +
+      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a><br/><br/>` +
+      `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
+    return { plain, html };
+  }
+  // Press-Enter acknowledgment (e.g. post-login "Login successful.
+  // Press Enter to continue…"). Extract the result line above the cue.
+  if (/press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i.test(screen)) {
+    const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
+    const resultLine =
+      lines.find(l => /logged\s+in\s+as|login\s+successful|complete[d]?|finished|✅/i.test(l)) ||
+      lines.find(l => l.length > 5 && !/press\s+enter|esc\s+to/i.test(l)) ||
+      'Claude is continuing…';
+    const plain = `✅ ${resultLine}`;
+    const html = `<b>✅ ${escapeHtml(resultLine)}</b>`;
+    return { plain, html };
+  }
+  // Generic input cue we couldn't parse — surface a one-liner pointing
+  // at the cue with any URLs, but don't dump the whole screen.
+  if (urls.length > 0) {
+    const plain = `Claude is asking you to act on this URL:\n${urls.join('\n')}`;
+    const html =
+      `<b>Claude is asking you to act on this URL:</b><br/>` +
+      urls.map(u => `<a href="${escapeHtml(u)}">${escapeHtml(u)}</a>`).join('<br/>');
+    return { plain, html };
+  }
+  return null;
 }
 
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
@@ -775,39 +817,23 @@ function handleInteractiveScreenUpdate(session, update) {
   const newUrls = urls.filter(u => !session.surfacedUrls.has(u));
   if (newUrls.length === 0 && !hasInputCue) return;
   for (const u of newUrls) session.surfacedUrls.add(u);
-  // Trim to the visible tail and un-wrap URLs that claude broke across
-  // lines at terminal width. We keep blank lines (collapse 3+ to 2) so
-  // unwrapUrls can distinguish a real URL-wrap break (`...redir\nect_uri=...`,
-  // no blank between) from a paragraph boundary (`...&state=9Y\n\nPaste
-  // code here`, blank between). Without that, the un-wrapper merges
-  // "Paste" into the URL because "P" is a URL-safe char.
-  // We also drop the TUI status chrome (input-cue prompt cursor, the
-  // bypass-permissions footer, separator bars, OSC title leaks,
-  // in-progress task lists) so the user sees just the actionable
-  // content. Removing this noise also keeps the message under the
-  // ~50-line cap so the OAuth URL is always visible.
-  const cleanedLines = screen
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => !isTuiChromeLine(l));
-  const collapsed = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n');
-  const tail = unwrapUrls(collapsed.split('\n').slice(-30).join('\n')).trim();
-  let plain;
-  let html;
-  if (newUrls.length > 0) {
-    plain = `Claude is showing:\n${tail}`;
-    const linkified = escapeHtml(tail).replace(
-      /(https?:\/\/[^\s<]+)/g,
-      '<a href="$1">$1</a>'
-    );
-    html = `<b>Claude is showing:</b><br/><pre>${linkified}</pre>`;
-  } else {
-    plain = `Claude is asking:\n${tail}\n\n(Reply with the requested text)`;
-    html = `<b>🟡 Claude is asking:</b><br/><pre>${escapeHtml(tail)}</pre><br/><i>(Reply with the requested text)</i>`;
+  // Un-wrap URLs that claude broke across lines at terminal width so
+  // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
+  const unwrappedScreen = unwrapUrls(
+    screen.split('\n').map(l => l.trim()).join('\n')
+  );
+  // Build a clean cue-specific message instead of dumping the raw
+  // screen. If the formatter can't make sense of the cue, skip rather
+  // than spam a screen-dump full of status chrome.
+  const allUrls = extractAllUrls(unwrappedScreen);
+  const message = formatTuiCueMessage(unwrappedScreen, allUrls);
+  if (!message) {
+    console.log(`[IV-DEBUG] Free-text TUI cue not parseable, skipping (urls=${newUrls.length}, inputCue=${hasInputCue})`);
+    return;
   }
-  console.log(`[IV-DEBUG] Surfacing free-text TUI screen (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
-  if (session.sendHtml) session.sendHtml(plain, html);
-  else if (session.sendCallback) session.sendCallback(plain);
+  console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
+  if (session.sendHtml) session.sendHtml(message.plain, message.html);
+  else if (session.sendCallback) session.sendCallback(message.plain);
   // Cancel typing — the user now has something to act on.
   if (session.typingInterval) {
     clearInterval(session.typingInterval);
@@ -821,7 +847,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // claude, which is confusing UX. We surface the screen content FIRST
   // (so the user sees "Login successful" etc) then send Enter and a
   // small confirmation note.
-  if (AUTO_ENTER_CUE_RE.test(tail)) {
+  if (AUTO_ENTER_CUE_RE.test(unwrappedScreen)) {
     console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
     try {
       session.iv.sendKeystroke('enter');
