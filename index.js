@@ -729,6 +729,21 @@ function maybeResolveInteractivePrompt(session, userText) {
   return true;
 }
 
+// Iteratively rejoin URLs that claude wrapped at terminal width. We only
+// merge a `\n` into a URL when the next line begins with characters that
+// can only be URL continuation (no spaces, only URL-safe chars), so prose
+// that happens to follow a URL stays on its own line.
+function unwrapUrls(text) {
+  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n([A-Za-z0-9=&/%+\-._~?#]+)/g;
+  let prev;
+  let out = text;
+  do {
+    prev = out;
+    out = out.replace(URL_HEAD, '$1$2');
+  } while (out !== prev);
+  return out;
+}
+
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
 // enter to continue" notices) to Matrix. Triggered by the prompt-detector's
 // `screen-update` event whenever the screen settles with URLs or input
@@ -747,13 +762,19 @@ function handleInteractiveScreenUpdate(session, update) {
   if (newUrls.length === 0 && !hasInputCue) return;
   for (const u of newUrls) session.surfacedUrls.add(u);
   // Trim to the visible tail (last 30 non-blank lines) to avoid dumping
-  // the whole accumulated PTY buffer to Matrix.
-  const tail = screen
-    .split('\n')
-    .map(l => l.trim())
-    .filter(Boolean)
-    .slice(-30)
-    .join('\n');
+  // the whole accumulated PTY buffer to Matrix, and un-wrap URLs that
+  // claude broke across lines at terminal width — without this the
+  // OAuth `/login` URL ends up split as `https://...redir\nect_uri=...`
+  // and Matrix renders only the first half as a clickable link, which
+  // makes the whole login flow unusable.
+  const tail = unwrapUrls(
+    screen
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .slice(-30)
+      .join('\n')
+  );
   let plain;
   let html;
   if (newUrls.length > 0) {
