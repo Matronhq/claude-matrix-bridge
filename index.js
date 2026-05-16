@@ -501,6 +501,20 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
     session.pendingInteractivePrompt = prompt;
+    // A TUI prompt means claude has stopped processing and is awaiting
+    // user input. The Stop hook is unreliable for these states (e.g.
+    // first-run modals, /login, unauthenticated "please run /login"
+    // pseudo-turns) — without this the bridge's `busy` flag gets stuck
+    // and every subsequent user message hits the queue path.
+    if (session.busy) {
+      console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
     handleInteractivePrompt(session, prompt);
   });
 
@@ -3032,8 +3046,16 @@ client.on('room.message', async (roomId, event) => {
     // Falls through to normal message handling below
   }
 
-  // Queue/interrupt logic when Claude is busy
-  if (session.busy) {
+  // In iv-mode, claude-side slash commands (/login, /mcp, /commit, etc)
+  // are TUI control commands — they belong in claude's input buffer, not
+  // in the bridge's "next user prompt" queue. Bypass the busy/queue path
+  // so they flow straight through to the PTY. Without this, /login
+  // sits in the queue forever if the previous turn's Stop hook didn't
+  // fire (e.g. for unauthenticated "Please run /login" pseudo-turns)
+  // and the user can't recover without manually flushing.
+  const isClaudeSlashCommand =
+    session.iv && text.startsWith('/') && !text.startsWith('//');
+  if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
     if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
