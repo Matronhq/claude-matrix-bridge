@@ -729,6 +729,20 @@ function maybeResolveInteractivePrompt(session, userText) {
   return true;
 }
 
+// Lines of claude TUI chrome that add no value when we surface a free-
+// text screen to Matrix: the status footer ("⏵⏵ bypass permissions on
+// · 1 shell · esc to interrupt"), separator bars, OSC window-title leaks
+// (`0;⠐ New project setup`), the bare input cursor (`❯` on its own),
+// task-list status lines, and lone spinner glyphs. Anything that's
+// actually useful (the question text, URLs, "Press Enter" cues,
+// "Logged in as X" results) is preserved.
+const TUI_CHROME_RE = /^(?:[─━—=_]{4,}|⏵⏵\s|◉|◼|◯|✻|✶|✽|✢|◆|❯\s*$|❯$|\*$|·$|\d+\s*tasks?\s+\(.*\)|0;|\[\d|✔\s|⠐|⠂|⠈|⠁|⠉|⠋|⠓|⠞|⠦|⠴|⠲|⠳|⠷|⠶|⠧|⠇|⠏|.*\bshift\+tab\b.*cycle.*|.*\besc\b\s+to\s+(?:cancel|interrupt).*)/i;
+
+function isTuiChromeLine(line) {
+  if (!line) return true;
+  return TUI_CHROME_RE.test(line);
+}
+
 // Iteratively rejoin URLs that claude wrapped at terminal width. We only
 // merge a `\n` into a URL when the next line begins with characters that
 // can only be URL continuation (no spaces, only URL-safe chars), so prose
@@ -762,19 +776,22 @@ function handleInteractiveScreenUpdate(session, update) {
   if (newUrls.length === 0 && !hasInputCue) return;
   for (const u of newUrls) session.surfacedUrls.add(u);
   // Trim to the visible tail and un-wrap URLs that claude broke across
-  // lines at terminal width. CRITICAL: we keep blank lines (just trim
-  // each line's whitespace and collapse 3+ blanks to 2) so unwrapUrls
-  // can distinguish a real URL-wrap break (`...redir\nect_uri=...`,
+  // lines at terminal width. We keep blank lines (collapse 3+ to 2) so
+  // unwrapUrls can distinguish a real URL-wrap break (`...redir\nect_uri=...`,
   // no blank between) from a paragraph boundary (`...&state=9Y\n\nPaste
-  // code here`, blank between). Without the blank-line preservation,
-  // the un-wrapper happily merged "Paste" into the URL because "P" is
-  // a URL-safe char, producing a broken clickable link AND mangling
-  // the question text below it.
-  const trimmedLines = screen.split('\n').map(l => l.trim());
-  const collapsed = trimmedLines
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n');
-  const tail = unwrapUrls(collapsed.split('\n').slice(-50).join('\n')).trim();
+  // code here`, blank between). Without that, the un-wrapper merges
+  // "Paste" into the URL because "P" is a URL-safe char.
+  // We also drop the TUI status chrome (input-cue prompt cursor, the
+  // bypass-permissions footer, separator bars, OSC title leaks,
+  // in-progress task lists) so the user sees just the actionable
+  // content. Removing this noise also keeps the message under the
+  // ~50-line cap so the OAuth URL is always visible.
+  const cleanedLines = screen
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => !isTuiChromeLine(l));
+  const collapsed = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n');
+  const tail = unwrapUrls(collapsed.split('\n').slice(-30).join('\n')).trim();
   let plain;
   let html;
   if (newUrls.length > 0) {
