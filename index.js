@@ -1368,9 +1368,21 @@ function sendToSession(session, contentBlocks) {
       debug(`iv-mode: dropping ${nonText.length} non-text block(s): ${nonText.map(b => b.type).join(',')}`);
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
-    if (text) session.iv.sendText(text);
-    if (session.resetTimeout) session.resetTimeout();
-    return true;
+    if (text) {
+      session.iv.sendText(text);
+      if (session.resetTimeout) session.resetTimeout();
+      return true;
+    }
+    // Nothing to send (all blocks were non-text and got dropped). Don't
+    // leave the session in `busy=true` with a stuck typing indicator —
+    // no claude turn means no Stop hook to clear them.
+    session.busy = false;
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+    return false;
   }
 
   const jsonMsg = JSON.stringify({
