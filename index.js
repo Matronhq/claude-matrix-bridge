@@ -1050,21 +1050,24 @@ function handleSubagentEvent(session, { label, event }) {
 }
 
 function handleClaudeEvent(session, event) {
-  // Capture session ID from any event that carries it
+  // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
+  }
 
-    // Lazy-construct subagent watcher now that we know the session id.
-    // Print-mode fresh sessions don't have the id at spawn time; this is
-    // the first event that carries it. (iv-mode already constructed its
-    // watcher up front.) The watcher doesn't poll until notifyTaskStarted().
-    if (!session.subagentWatcher) {
-      session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
-      session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
-      session.subagentWatcher.snapshot();
-    }
+  // Lazy-construct subagent watcher once we know the session id. Print-mode
+  // resumed sessions get the watcher built eagerly in createSession() (since
+  // claudeSessionId is already populated at spawn); fresh print-mode
+  // sessions only learn their id when the first event with `session_id`
+  // arrives, so the watcher is constructed here. iv-mode constructs its
+  // watcher up front. Decoupled from the id-capture block above so future
+  // refactors can't silently lose the watcher on either spawn path.
+  if (session.claudeSessionId && !session.subagentWatcher) {
+    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
+    session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+    session.subagentWatcher.snapshot();
   }
 
   // Log all event types for plan mode debugging
@@ -1315,6 +1318,17 @@ function handleClaudeEvent(session, event) {
     }
 
     case 'result': {
+      // iv-mode handles turn end via the Stop hook → onTurnEnd; the iv-mode
+      // transcript should not emit result events in normal operation. If
+      // one does appear (defensive: claude CLI changes, new transcript
+      // shape), skip the duplicating work to avoid double-count
+      // turnCount, double-flush responseBuffer, double tool-summary,
+      // double busy/typing clear, and double queue drain — all of which
+      // onTurnEnd already does.
+      if (session.iv) {
+        debug('Unexpected result event for iv-mode session — onTurnEnd is authoritative; ignoring duplicate.');
+        break;
+      }
       // Handle fatal errors (e.g. failed resume with invalid session ID)
       if (event.is_error && event.errors?.length) {
         const noSession = event.errors.some(e => /no conversation found/i.test(e));
