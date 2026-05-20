@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
-import { macifyMcpServers } from './lib/mcp-config-mac.js';
+import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -36,7 +36,13 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
 // --resume. Set to 0 to disable.
-const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '86400000', 10);
+// Default 1h. Reaping is silent and the next user message auto-resumes the
+// session via the existing path, so the only cost is a few-second resume on
+// re-entry — well worth it on memory-constrained hosts where idle sessions
+// previously piled up for a full day (~1G each with default extras). Override
+// via SESSION_IDLE_TIMEOUT_MS (set to 86400000 to restore the old 24h
+// behaviour, or 0 to disable the reaper entirely).
+const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
@@ -47,16 +53,47 @@ const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
-// The on-disk baseline assumes Linux (xvfb-run wraps puppeteer/chrome-devtools); on macOS
-// we strip that wrapper before writing the generated file so those MCP servers actually
-// start instead of failing with `spawn xvfb-run ENOENT`.
-const MCP_CONFIG_PATH = path.join(__dirname, '.mcp-config-generated.json');
-let mcpConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
-mcpConfig.mcpServers['ask-user'].args[0] = path.join(__dirname, 'ask-user.js');
-if (process.platform === 'darwin') {
-  mcpConfig = macifyMcpServers(mcpConfig);
+// The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
+// strip that wrapper before writing the generated file so the server actually starts
+// instead of failing with `spawn xvfb-run ENOENT`.
+//
+// mcp-config.json has two sections:
+//   `mcpServers` — always-on (ask-user) — every session gets these
+//   `mcpExtras`  — opt-in groups keyed by name (e.g. `browser`) — selected per
+//                  session via flags on /start, /resume, /workdir
+// Per opt-in combination we write a separate generated file (`.mcp-config-
+// generated[.<extras>].json`) and pass its path to claude. Each browser stack
+// is ~400M resident, so defaulting to none keeps lightweight sessions lean.
+const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
+
+function mcpConfigPathFor(extras = []) {
+  const { config, extras: sorted } = buildMcpServers({
+    baseConfig: RAW_MCP_CONFIG,
+    extras,
+    askUserBaseDir: __dirname,
+  });
+  const key = sorted.join(',');
+  const cached = mcpConfigPathCache.get(key);
+  if (cached) return cached;
+  const suffix = sorted.length ? '.' + sorted.join('-') : '';
+  const p = path.join(__dirname, `.mcp-config-generated${suffix}.json`);
+  fs.writeFileSync(p, JSON.stringify(config, null, 2));
+  mcpConfigPathCache.set(key, p);
+  return p;
 }
-fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
+
+// Eagerly materialise the default (no-extras) config so the file exists on
+// disk by the time any session spawns. Per-extras variants are generated
+// lazily on first use.
+mcpConfigPathFor([]);
+// Sanity check: make sure the bridge's known extras stay in sync with what
+// the config file declares.
+for (const ex of knownMcpExtras()) {
+  if (!RAW_MCP_CONFIG.mcpExtras?.[ex]) {
+    console.warn(`[mcp-config] Flag --${ex} is recognised but no matching mcpExtras block exists; sessions opting in will get no extra servers.`);
+  }
+}
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
@@ -195,7 +232,22 @@ function savePersistedSessions(data) {
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const data = loadPersistedSessions();
   const existing = data[String(roomId)] || {};
-  data[String(roomId)] = { ...existing, sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null, ...(extra || {}) };
+  // Auto-carry session-scoped fields (mcpExtras) from the live session if the
+  // caller didn't override them — most persistSession sites only know about
+  // the field they're updating (chatHistory, pendingPlanDenialId, etc.) and
+  // shouldn't have to remember to forward unrelated session state.
+  const live = sessions.get(roomId);
+  const derived = {};
+  if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  data[String(roomId)] = {
+    ...existing,
+    ...derived,
+    sessionId,
+    workdir,
+    lastUsed: Date.now(),
+    originRoomId: originRoomId || null,
+    ...(extra || {}),
+  };
   savePersistedSessions(data);
 }
 
@@ -208,9 +260,9 @@ function getPersistedSession(roomId) {
 
 const sessions = new Map(); // roomId -> session
 
-function createSession(roomId, workdir, resumeSessionId) {
+function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (INTERACTIVE_MODE) {
-    return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId);
+    return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
@@ -219,6 +271,13 @@ function createSession(roomId, workdir, resumeSessionId) {
   // Unset (undefined) means "never toggled" → use the default (on).
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  // mcpExtras: explicit caller-supplied value wins (used by /start, /resume,
+  // /workdir handlers that parsed user flags); otherwise fall back to whatever
+  // was persisted for this room so /restart and bridge restarts honour the
+  // session's previous choice.
+  const mcpExtras = Array.isArray(options.mcpExtras)
+    ? options.mcpExtras
+    : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const args = [
     '--print',
     '--verbose',
@@ -228,7 +287,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
-    '--mcp-config', MCP_CONFIG_PATH,
+    '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify({
       hooks: {
         PreCompact: [{
@@ -285,6 +344,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     proc,
     roomId,
     workdir: cwd,
+    mcpExtras,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -367,7 +427,11 @@ function createSession(roomId, workdir, resumeSessionId) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        // Pass mcpExtras explicitly: createSession can fall back to persisted
+        // state, but a print-mode session that crashes before its session_id
+        // is delivered hasn't been persisted yet, and would silently respawn
+        // without the user's --browser opt-in.
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -425,10 +489,13 @@ function createSession(roomId, workdir, resumeSessionId) {
 // plan approval comes from the PreToolUse:ExitPlanMode hook. Returns a
 // session object with the same shape as createSession() so downstream code
 // (Matrix posting, queue management, restart) is unchanged.
-function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
+function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  const mcpExtras = Array.isArray(options.mcpExtras)
+    ? options.mcpExtras
+    : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const sessionId = resumeSessionId || randomUUID();
 
   const settings = {
@@ -467,7 +534,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
-    '--mcp-config', MCP_CONFIG_PATH,
+    '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify(settings),
   );
 
@@ -501,6 +568,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
     iv,
     roomId,
     workdir: cwd,
+    mcpExtras,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -582,7 +650,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        // Pass mcpExtras explicitly (see the matching block in print-mode
+        // createSession): the persistence-fallback in createSession can miss
+        // a fresh session that crashed before its first persist.
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -2622,7 +2693,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const arg = parts[1];
+      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
+      const arg = positional[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -2656,15 +2728,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, workdir);
+      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // In iv-mode claudeSessionId is known immediately, so persist mcpExtras
+      // now — otherwise a bridge restart before the first transcript-driven
+      // persist would lose the user's opt-in. Print-mode sessions get their
+      // claudeSessionId asynchronously and pick this up on the first persist.
+      if (mcpExtras.length > 0 && session.claudeSessionId) {
+        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
+      }
 
       // Confirm in origin room with a link to the new room
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      await sendReply(`Session started in new room: ${roomLink}`);
+      const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
+      await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -2696,12 +2776,22 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Use !start to begin.');
         return;
       }
+      // /restart accepts the same MCP-extras flags as /start so you can
+      // toggle browser tools on mid-conversation without losing the
+      // session ID. Passing no flags preserves whatever extras the session
+      // already has — set in-memory and falling back to the persisted
+      // value if the bridge was restarted in between.
+      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
+      const effectiveRestartExtras = restartFlagExtras.length > 0
+        ? restartFlagExtras
+        : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       sessions.delete(roomId);
       killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId);
+      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
       restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -2712,8 +2802,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (restartSessionId) {
         persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
       }
+      const extrasLine = effectiveRestartExtras.length > 0
+        ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
+        : '';
       await sendReply(
-        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
+        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
       );
       break;
     }
@@ -2724,7 +2817,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const resumeArg = parts[1]?.replace(/\.+$/, '') || undefined;
+      const { extras: resumeExtras, rest: resumeTokens } = extractMcpExtraFlags(parts.slice(1));
+      const resumeArg = resumeTokens[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
         // No arg — show sessions list inline
@@ -2818,7 +2912,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId);
+      // Inherit the resumed session's previously persisted extras unless the
+      // user is explicitly overriding via the command line; this lets a
+      // resume "just work" if /start --browser was used originally.
+      const resumePersisted = getPersistedSession(sessionRoomId) || (resumeSessionId
+        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
+        : null);
+      const effectiveResumeExtras = resumeExtras.length > 0
+        ? resumeExtras
+        : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
@@ -2845,7 +2948,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const newDir = parts.slice(1).join(' ');
+      const { extras: workdirExtras, rest: workdirTokens } = extractMcpExtraFlags(parts.slice(1));
+      const newDir = workdirTokens.join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
         const current = session?.workdir || DEFAULT_WORKDIR;
@@ -2881,11 +2985,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, resolved);
+      const session = createSession(sessionRoomId, resolved, undefined, { mcpExtras: workdirExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      if (workdirExtras.length > 0 && session.claudeSessionId) {
+        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
+      }
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
@@ -3026,12 +3133,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Available commands:\n\n` +
         `/start — Start a new session (creates a new room)\n` +
         `/start <workdir> — Start in a specific directory\n` +
+        `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Stop and immediately resume the session\n` +
+        `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
         `/resume <n> — Resume session #n from /sessions list\n` +
-        `/resume <id> — Resume session by ID prefix\n` +
+        `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
         `/sessions — List all past sessions\n` +
-        `/workdir <path> — Start session in a different directory\n` +
+        `/workdir <path> — Start session in a different directory (--browser also accepted)\n` +
         `/status — Show current session info\n` +
         `/working — Toggle tool call visibility\n` +
         `/mcp — Show MCP server status\n` +
@@ -3057,12 +3165,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         cmdGroup('Sessions', [
           ['/start', 'Start a new session (creates a new room)'],
           ['/start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
           ['/stop', 'Stop the current session'],
-          ['/restart', 'Stop and immediately resume the session'],
+          ['/restart', 'Stop and immediately resume the session (--browser also accepted)'],
           ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
-          ['/resume &lt;id&gt;', 'Resume session by ID prefix'],
+          ['/resume &lt;id&gt;', 'Resume session by ID prefix (--browser also accepted)'],
           ['/sessions', 'List all past sessions'],
-          ['/workdir &lt;path&gt;', 'Start session in a different directory'],
+          ['/workdir &lt;path&gt;', 'Start session in a different directory (--browser also accepted)'],
         ]) +
         cmdGroup('Info', [
           ['/status', 'Show current session info'],

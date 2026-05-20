@@ -6,17 +6,14 @@
       "env": {
         "BRIDGE_API_URL": "http://127.0.0.1:9802"
       }
-    },
-    "puppeteer": {
-      "command": "xvfb-run",
-      "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "@modelcontextprotocol/server-puppeteer"],
-      "env": {
-        "PUPPETEER_LAUNCH_OPTIONS": "{\"headless\": false, \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\"]}"
+    }
+  },
+  "mcpExtras": {
+    "browser": {
+      "chrome-devtools": {
+        "command": "xvfb-run",
+        "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
       }
-    },
-    "chrome-devtools": {
-      "command": "xvfb-run",
-      "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
     }
   }
 }

@@ -33,3 +33,11 @@ Before posting data, ask whether it could be used for access, whether exposure w
 ## Viewer Links
 
 Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_URL` configured. If `share_sensitive_data` or file-view links report that the viewer is not configured, tell the user that the local viewer service is running but needs a public `VIEWER_BASE_URL`, usually via Cloudflare Tunnel.
+
+## Browser tools (chrome-devtools MCP)
+
+Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — you cannot enable them from inside this session.
+
+Tell the user: "I need browser tools to do X. Please run `/restart --browser` — that keeps this exact session intact and just respawns the underlying claude process with chrome-devtools loaded. (`--browser` also works on `/start`, `/resume`, and `/workdir` if you'd rather create a new session.)"
+
+Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — surface the opt-in request to the user instead.
