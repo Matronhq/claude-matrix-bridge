@@ -2763,12 +2763,22 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Use !start to begin.');
         return;
       }
+      // /restart accepts the same MCP-extras flags as /start so you can
+      // toggle browser tools on mid-conversation without losing the
+      // session ID. Passing no flags preserves whatever extras the session
+      // already has — set in-memory and falling back to the persisted
+      // value if the bridge was restarted in between.
+      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
+      const effectiveRestartExtras = restartFlagExtras.length > 0
+        ? restartFlagExtras
+        : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       sessions.delete(roomId);
       killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId);
+      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
       restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -2779,8 +2789,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (restartSessionId) {
         persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
       }
+      const extrasLine = effectiveRestartExtras.length > 0
+        ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
+        : '';
       await sendReply(
-        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
+        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
       );
       break;
     }
@@ -3109,7 +3122,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Stop and immediately resume the session\n` +
+        `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
         `/resume <n> — Resume session #n from /sessions list\n` +
         `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
         `/sessions — List all past sessions\n` +
@@ -3141,7 +3154,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
           ['/stop', 'Stop the current session'],
-          ['/restart', 'Stop and immediately resume the session'],
+          ['/restart', 'Stop and immediately resume the session (--browser also accepted)'],
           ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
           ['/resume &lt;id&gt;', 'Resume session by ID prefix (--browser also accepted)'],
           ['/sessions', 'List all past sessions'],

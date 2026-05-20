@@ -38,6 +38,6 @@ Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_UR
 
 Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — you cannot enable them from inside this session.
 
-Tell the user: "I need browser tools to do X. Please `/stop` this session and start a new one with `/start --browser` (optionally followed by a workdir) — or `/resume <id> --browser` / `/workdir <path> --browser` for an existing session. The flag also works on `/resume` and `/workdir`."
+Tell the user: "I need browser tools to do X. Please run `/restart --browser` — that keeps this exact session intact and just respawns the underlying claude process with chrome-devtools loaded. (`--browser` also works on `/start`, `/resume`, and `/workdir` if you'd rather create a new session.)"
 
 Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — surface the opt-in request to the user instead.
