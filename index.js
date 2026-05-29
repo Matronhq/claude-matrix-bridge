@@ -3154,14 +3154,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !usage — Token usage\n` +
         `  !tools — Available tools\n` +
         `  !help — This help message\n\n` +
-        `! = bridge handles it. / = forwarded to Claude Code CLI.\n\n` +
+        `! = bridge command. Other / commands are forwarded to Claude Code CLI.\n\n` +
         `Each !start, !resume, and !workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "send" to flush the queue\n` +
-        `  Send "interrupt" to cancel the current turn\n` +
-        `  Send "cancel" to drop last queued message\n\n` +
+        `  "send" or "interrupt" to flush the queue now\n` +
+        `  "cancel" to drop last queued message\n\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
       const cmdGroup = (title, cmds) => {
@@ -3191,11 +3190,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!help', 'This help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li><code>!</code> = bridge handles it. <code>/</code> = forwarded to Claude Code CLI.</li>` +
+        `<li><code>!</code> = bridge command. Other <code>/</code> commands are forwarded to Claude Code CLI.</li>` +
         `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
-        `<li><code>send</code> flushes the queue; <code>interrupt</code> cancels the turn; <code>cancel</code> drops last queued message</li>` +
+        `<li><code>send</code>/<code>interrupt</code> flush the queue; <code>cancel</code> drops last queued message</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
