@@ -527,13 +527,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const sessionId = resumeSessionId || randomUUID();
 
   const settings = {
-    permissions: {
-      allow: [
-        'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)',
-        'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
-      ],
-      deny: [],
-    },
+    permissions: BRIDGE_PERMISSIONS,
     hooks: {
       PreCompact: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
@@ -2639,11 +2633,13 @@ function getSessionSummary(sessionId, workdir) {
  * This prevents sending duplicate tool_results which cause API 400 errors.
  */
 function hasToolResultInHistory(sessionId, workdir, toolUseId, worktreeName) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const encodeDir = (dir) => dir.replace(/\//g, '-');
+  const encodedPath = encodeDir(workdir || DEFAULT_WORKDIR);
   // Check both base workdir and worktree transcript paths
   const candidates = [path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)];
   if (worktreeName) {
-    candidates.push(path.join(os.homedir(), '.claude', 'projects', `${encodedPath}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`));
+    const worktreeCwd = path.join(workdir || DEFAULT_WORKDIR, '.claude', 'worktrees', worktreeName);
+    candidates.push(path.join(os.homedir(), '.claude', 'projects', encodeDir(worktreeCwd), `${sessionId}.jsonl`));
   }
   for (const filePath of candidates) {
     try {
@@ -2941,7 +2937,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (!entry.sessionId || seenResumeIds.has(entry.sessionId)) continue;
         if (!entry.worktree) continue;
         if (entry.workdir && entry.workdir !== resumeWorkdir) continue;
-        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtCwd = path.join(entry.workdir || resumeWorkdir, '.claude', 'worktrees', entry.worktree);
+        const wtEncoded = wtCwd.replace(/\//g, '-');
         const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
         let mtimeMs = entry.lastUsed || Date.now();
         try { mtimeMs = fs.statSync(wtPath).mtimeMs; } catch { /* short session, no transcript yet */ }
@@ -2980,7 +2977,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             const altEncoded = foundEntry.workdir.replace(/\//g, '-');
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (fs.existsSync(altFile)) {
+            let found = fs.existsSync(altFile);
+            if (!found && foundEntry.worktree) {
+              const wtCwd = path.join(foundEntry.workdir, '.claude', 'worktrees', foundEntry.worktree);
+              const wtFile = path.join(os.homedir(), '.claude', 'projects', wtCwd.replace(/\//g, '-'), `${foundEntry.sessionId}.jsonl`);
+              found = fs.existsSync(wtFile);
+            }
+            if (found) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
             }
@@ -3217,7 +3220,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (!entry.worktree) continue;
         if (entry.workdir && entry.workdir !== workdir) continue;
         // Find the transcript in the worktree project dir
-        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtCwd = path.join(entry.workdir || workdir, '.claude', 'worktrees', entry.worktree);
+        const wtEncoded = wtCwd.replace(/\//g, '-');
         const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
         let modified = entry.lastUsed || Date.now();
         try {
