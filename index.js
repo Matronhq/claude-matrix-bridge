@@ -181,6 +181,14 @@ function debug(...args) {
   if (DEBUG) console.log('[DEBUG]', ...args);
 }
 
+const BRIDGE_PERMISSIONS = {
+  allow: [
+    'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)',
+    'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)',
+    'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)',
+  ],
+  deny: [],
+};
 // --- Session Persistence ---
 
 const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
@@ -289,13 +297,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify({
-      permissions: {
-        allow: [
-          'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)',
-          'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
-        ],
-        deny: [],
-      },
+      permissions: BRIDGE_PERMISSIONS,
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -560,7 +562,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
+  // Worktree is not supported in iv-mode: the transcript tail derives
+  // its path from cwd, but --worktree changes Claude's actual cwd to a
+  // worktree directory. The tail would read the wrong JSONL. Reject
+  // worktree requests in iv-mode until transcript routing is implemented.
   const worktreeName = options.worktree || persistedForRoom?.worktree || null;
+  if (worktreeName) {
+    throw new Error('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
+  }
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
