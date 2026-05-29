@@ -2767,16 +2767,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (session.iv) session.iv.sendKeystroke('esc');
         else if (session.proc) session.proc.kill('SIGINT');
       } catch { /* ignore */ }
-      if (session.busy) {
-        session.busy = false;
-        if (session.typingInterval) {
-          clearInterval(session.typingInterval);
-          session.typingInterval = null;
-          client.setTyping(session.roomId, false, 1000).catch(() => {});
-        }
-      }
       session._interrupted = true;
-      await sendReply('⎋ Interrupt sent — cancelling the current turn.');
+      await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
       break;
     }
 
@@ -3187,6 +3179,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
         `  "send" or "interrupt" to flush the queue now\n` +
+        `  !esc to cancel the current turn (never queued)\n` +
         `  "cancel" to drop last queued message\n\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -3222,7 +3215,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
-        `<li><code>send</code>/<code>interrupt</code> flush the queue; <code>cancel</code> drops last queued message</li>` +
+<<<<<<< HEAD
+        `<li><code>send</code>/<code>interrupt</code> flush the queue; <code>!esc</code> cancels the turn; <code>cancel</code> drops last queued message</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
