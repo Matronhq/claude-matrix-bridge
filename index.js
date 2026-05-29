@@ -2630,29 +2630,33 @@ function getSessionSummary(sessionId, workdir) {
  * Check if the session's JSONL history already contains a tool_result for the given tool_use_id.
  * This prevents sending duplicate tool_results which cause API 400 errors.
  */
-function hasToolResultInHistory(sessionId, workdir, toolUseId) {
+function hasToolResultInHistory(sessionId, workdir, toolUseId, worktreeName) {
   const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
-  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n');
-    // Scan from end (most recent) for efficiency
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      // Quick string check before parsing JSON
-      if (!line.includes(toolUseId)) continue;
-      let record;
-      try { record = JSON.parse(line); } catch { continue; }
-      if (record.type === 'user' && Array.isArray(record.message?.content)) {
-        for (const block of record.message.content) {
-          if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
-            return true;
+  // Check both base workdir and worktree transcript paths
+  const candidates = [path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)];
+  if (worktreeName) {
+    candidates.push(path.join(os.homedir(), '.claude', 'projects', `${encodedPath}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`));
+  }
+  for (const filePath of candidates) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const lines = content.split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (!line.includes(toolUseId)) continue;
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (record.type === 'user' && Array.isArray(record.message?.content)) {
+          for (const block of record.message.content) {
+            if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
+              return true;
+            }
           }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
   return false;
 }
 
@@ -2773,6 +2777,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           return;
         }
         workdir = resolved;
+      }
+
+      // Reject --worktree in interactive mode before creating a room
+      if (worktree && INTERACTIVE_MODE) {
+        await sendReply('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
+        return;
       }
 
       // Create a new room for this session
@@ -3646,7 +3656,7 @@ client.on('room.message', async (roomId, event) => {
     // Claude CLI auto-generates a tool_result for permission denials, so sending another
     // one causes a duplicate tool_result API 400 error.
     const alreadyAnswered = toolUseId && session.claudeSessionId
-      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId, session.worktree)
       : false;
     console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
