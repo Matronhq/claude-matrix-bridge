@@ -74,11 +74,14 @@ function loadRoles() {
 }
 
 function saveRoles() {
+  const tmp = ROLES_FILE + '.tmp';
   try {
-    fs.writeFileSync(ROLES_FILE, JSON.stringify(Object.fromEntries(roles), null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(roles), null, 2));
+    fs.renameSync(tmp, ROLES_FILE);
     return true;
   } catch (e) {
     console.error('Failed to save roles file:', e.message);
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
     return false;
   }
 }
@@ -3097,9 +3100,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             break;
           }
         }
+        const prevRole = roles.get(targetUser);
         roles.set(targetUser, newRole);
         if (!saveRoles()) {
-          roles.delete(targetUser);
+          if (prevRole) roles.set(targetUser, prevRole);
+          else roles.delete(targetUser);
           await sendReply('Failed to save role — change rolled back.');
           break;
         }
