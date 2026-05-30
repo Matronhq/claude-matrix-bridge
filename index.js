@@ -3014,6 +3014,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const newLabel = text.replace(/^!\w+\s*/, '').trim();
       if (!newLabel) {
         await sendReply(`Current server label: ${SERVER_LABEL}`);
+      } else if (!/^[A-Za-z0-9_. -]{1,16}$/.test(newLabel)) {
+        await sendReply('Label must be 1-16 characters: letters, numbers, spaces, _ . -');
       } else {
         SERVER_LABEL = newLabel;
         await sendReply(`Server label set to: ${SERVER_LABEL}`);
