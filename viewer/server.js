@@ -159,37 +159,69 @@ function renderSensitiveData(label, content) {
 </html>`;
 }
 
+// Sensitive-path denylist (mirrors lib/file-uploader.js at serve time)
+const SENSITIVE_BASENAME_RE = [
+  /\.env(\..*)?$/i, /secrets?\.(json|ya?ml|toml|txt)$/i, /^credentials$/i,
+  /credentials?\.(json|ya?ml|toml|txt)$/i, /\.(pem|key|p12|pfx|jks|keystore)$/i,
+  /id_rsa|id_ed25519|id_ecdsa/i, /\.npmrc$/i, /\.netrc$/i,
+  /token(s)?\.(json|txt)$/i, /service[-_]?account.*\.json$/i, /\.htpasswd$/i,
+];
+const SENSITIVE_PATH_RE = [/\/\.aws\//i, /\/\.docker\//i, /\/\.kube\//i, /\/\.ssh\//i, /\/\.gnupg\//i];
+function isSensitivePath(p) {
+  const bn = path.basename(p);
+  return SENSITIVE_BASENAME_RE.some(r => r.test(bn)) || SENSITIVE_PATH_RE.some(r => r.test(p));
+}
+
 // Re-enforce file policy at serve time. The signed token carries the policy
 // context (workdir, maxBytes) from link creation; we re-check here to defend
 // against TOCTOU (symlink swap, file growth between link creation and click).
+//
+// Opens with O_NOFOLLOW to reject symlinks, then validates the opened fd's
+// real path via /proc/self/fd for scope and sensitivity checks.
+import { constants as fsConstants } from 'fs';
 async function validateAndOpen(data) {
   const filePath = path.resolve(data.path);
 
-  // Workdir scope: realpath must be inside the signed workdir
-  if (data.workdir) {
-    let realPath, realWorkdir;
-    try { realPath = await fs.realpath(filePath); }
-    catch { return { error: 'File not found', status: 404 }; }
-    try { realWorkdir = await fs.realpath(data.workdir); }
-    catch { realWorkdir = data.workdir; }
-    if (realPath !== realWorkdir && !realPath.startsWith(realWorkdir + '/')) {
-      return { error: 'Access denied', status: 403 };
-    }
-  }
-
-  // Open + fstat from the same fd to avoid TOCTOU
+  // Open with O_NOFOLLOW — rejects symlinks at the final component
   let fh, stat;
   try {
-    fh = await fs.open(filePath, 'r');
+    fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     stat = await fh.stat();
   } catch (err) {
     if (fh) await fh.close().catch(() => {});
+    if (err.code === 'ELOOP') return { error: 'Symlinks not allowed', status: 403 };
     return { error: err.code === 'ENOENT' ? 'File not found' : 'Internal error', status: err.code === 'ENOENT' ? 404 : 500 };
   }
 
   if (!stat.isFile()) {
     await fh.close().catch(() => {});
     return { error: 'Not a regular file', status: 403 };
+  }
+
+  // Resolve the opened fd's real path via procfs — this is the actual file
+  // the kernel opened, immune to post-open path swaps
+  let realPath;
+  try {
+    realPath = await fs.readlink(`/proc/self/fd/${fh.fd}`);
+  } catch {
+    realPath = filePath;
+  }
+
+  // Workdir scope check against the opened fd's real path
+  if (data.workdir) {
+    let realWorkdir;
+    try { realWorkdir = await fs.realpath(data.workdir); }
+    catch { realWorkdir = data.workdir; }
+    if (realPath !== realWorkdir && !realPath.startsWith(realWorkdir + '/')) {
+      await fh.close().catch(() => {});
+      return { error: 'Access denied', status: 403 };
+    }
+  }
+
+  // Sensitivity check against both the token path and the opened real path
+  if (isSensitivePath(filePath) || isSensitivePath(realPath)) {
+    await fh.close().catch(() => {});
+    return { error: 'Access denied', status: 403 };
   }
 
   const maxBytes = data.maxBytes || 5242880;
