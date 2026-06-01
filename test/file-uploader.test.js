@@ -1,30 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import _fs from 'fs';
 import path from 'path';
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
-import { mimeForPath, isSensitivePath, resolveInWorkdir, uploadFileToRoom } from '../lib/file-uploader.js';
-
-describe('mimeForPath', () => {
-  it('returns correct MIME for known extensions', () => {
-    expect(mimeForPath('/foo/bar.js')).toBe('application/javascript');
-    expect(mimeForPath('/foo/bar.ts')).toBe('application/typescript');
-    expect(mimeForPath('/foo/bar.py')).toBe('text/x-python');
-    expect(mimeForPath('/foo/bar.json')).toBe('application/json');
-    expect(mimeForPath('/foo/bar.md')).toBe('text/markdown');
-    expect(mimeForPath('/foo/bar.png')).toBe('image/png');
-  });
-
-  it('returns application/octet-stream for unknown extensions', () => {
-    expect(mimeForPath('/foo/bar.xyz')).toBe('application/octet-stream');
-    expect(mimeForPath('/foo/bar.custom')).toBe('application/octet-stream');
-  });
-
-  it('handles case-insensitive extensions', () => {
-    expect(mimeForPath('/foo/bar.JS')).toBe('application/javascript');
-    expect(mimeForPath('/foo/bar.JSON')).toBe('application/json');
-  });
-});
+import { isSensitivePath, resolveInWorkdir, sendFileViewerLink } from '../lib/file-uploader.js';
 
 describe('isSensitivePath', () => {
   it('blocks .env files', () => {
@@ -65,7 +43,7 @@ describe('resolveInWorkdir', () => {
   let tmpDir;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'file-upload-test-'));
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'file-link-test-'));
     writeFileSync(path.join(tmpDir, 'inside.txt'), 'hello');
     writeFileSync('/tmp/outside-target.txt', 'secret');
   });
@@ -98,7 +76,6 @@ describe('resolveInWorkdir', () => {
   });
 
   it('rejects prefix-collision paths', async () => {
-    // /tmp/file-upload-test-ABC should not match /tmp/file-upload-test-ABCDEF
     const result = await resolveInWorkdir(tmpDir + 'extra/evil.txt', tmpDir);
     expect(result).toBeNull();
   });
@@ -109,150 +86,91 @@ describe('resolveInWorkdir', () => {
   });
 });
 
-describe('uploadFileToRoom', () => {
+describe('sendFileViewerLink', () => {
   let tmpDir;
-  let mockClient;
+  let sendHtml;
+  const VIEWER_URL = 'https://viewer.example.com';
+  const HMAC = 'test-secret-key-for-hmac';
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'file-upload-test-'));
-    mockClient = {
-      crypto: {
-        encryptMedia: vi.fn(async (_buf) => ({
-          buffer: Buffer.from('encrypted'),
-          file: { key: { kty: 'oct', key_ops: ['encrypt', 'decrypt'], alg: 'A256CTR', k: 'testkey', ext: true }, iv: 'testiv', hashes: { sha256: 'testhash' }, v: 'v2' },
-        })),
-      },
-      uploadContent: vi.fn(async () => 'mxc://example.com/abc123'),
-      sendMessage: vi.fn(async () => '$event123'),
-    };
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'file-link-test-'));
+    sendHtml = vi.fn();
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('uploads a file successfully', async () => {
+  it('sends a viewer link for a valid file', async () => {
     writeFileSync(path.join(tmpDir, 'test.js'), 'console.log("hello");');
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, 'test.js'), {
+    const result = await sendFileViewerLink(sendHtml, path.join(tmpDir, 'test.js'), {
       workdir: tmpDir,
       toolUseId: 'toolu_test1',
+      viewerBaseUrl: VIEWER_URL,
+      hmacSecret: HMAC,
     });
-    expect(result).toBe('$event123');
-    expect(mockClient.uploadContent).toHaveBeenCalled();
-    expect(mockClient.sendMessage).toHaveBeenCalledWith('!room:s', expect.objectContaining({
-      msgtype: 'm.file',
-      filename: 'test.js',
-      info: expect.objectContaining({ mimetype: 'application/javascript' }),
-    }));
+    expect(result).toMatch(/^https:\/\/viewer\.example\.com\/view\?token=/);
+    expect(sendHtml).toHaveBeenCalledTimes(1);
+    const [plain, html] = sendHtml.mock.calls[0];
+    expect(plain).toBe('📎 test.js');
+    expect(html).toContain('test.js');
+    expect(html).toContain('href=');
+  });
+
+  it('returns null when viewer is not configured', async () => {
+    writeFileSync(path.join(tmpDir, 'test.js'), 'code');
+    const result = await sendFileViewerLink(sendHtml, path.join(tmpDir, 'test.js'), {
+      workdir: tmpDir,
+      toolUseId: 'toolu_noviewer',
+    });
+    expect(result).toBeNull();
+    expect(sendHtml).not.toHaveBeenCalled();
   });
 
   it('skips files exceeding maxBytes', async () => {
     writeFileSync(path.join(tmpDir, 'big.txt'), 'x'.repeat(100));
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, 'big.txt'), {
+    const result = await sendFileViewerLink(sendHtml, path.join(tmpDir, 'big.txt'), {
       workdir: tmpDir,
       maxBytes: 50,
       toolUseId: 'toolu_big',
+      viewerBaseUrl: VIEWER_URL,
+      hmacSecret: HMAC,
     });
     expect(result).toBeNull();
-    expect(mockClient.uploadContent).not.toHaveBeenCalled();
+    expect(sendHtml).not.toHaveBeenCalled();
   });
 
   it('skips missing files', async () => {
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, 'nope.txt'), {
+    const result = await sendFileViewerLink(sendHtml, path.join(tmpDir, 'nope.txt'), {
       workdir: tmpDir,
       toolUseId: 'toolu_missing',
+      viewerBaseUrl: VIEWER_URL,
+      hmacSecret: HMAC,
     });
     expect(result).toBeNull();
-    expect(mockClient.uploadContent).not.toHaveBeenCalled();
-  });
-
-  it('returns null and logs on upload error', async () => {
-    writeFileSync(path.join(tmpDir, 'fail.txt'), 'data');
-    mockClient.uploadContent.mockRejectedValueOnce(new Error('413 Too Large'));
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, 'fail.txt'), {
-      workdir: tmpDir,
-      toolUseId: 'toolu_fail',
-    });
-    expect(result).toBeNull();
-  });
-
-  it('encrypts when encrypt option is true', async () => {
-    writeFileSync(path.join(tmpDir, 'encrypted-test.txt'), 'data');
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, 'encrypted-test.txt'), {
-      workdir: tmpDir,
-      encrypt: true,
-      toolUseId: 'toolu_enc',
-    });
-    expect(result).toBe('$event123');
-    expect(mockClient.crypto.encryptMedia).toHaveBeenCalled();
-    expect(mockClient.sendMessage).toHaveBeenCalledWith('!room:s', expect.objectContaining({
-      file: expect.objectContaining({ url: 'mxc://example.com/abc123' }),
-    }));
+    expect(sendHtml).not.toHaveBeenCalled();
   });
 
   it('denies files outside workdir', async () => {
-    const result = await uploadFileToRoom(mockClient, '!room:s', '/etc/passwd', {
+    const result = await sendFileViewerLink(sendHtml, '/etc/passwd', {
       workdir: tmpDir,
       toolUseId: 'toolu_outside',
+      viewerBaseUrl: VIEWER_URL,
+      hmacSecret: HMAC,
     });
     expect(result).toBeNull();
-    expect(mockClient.uploadContent).not.toHaveBeenCalled();
+    expect(sendHtml).not.toHaveBeenCalled();
   });
 
   it('denies sensitive files', async () => {
     writeFileSync(path.join(tmpDir, '.env.local'), 'SECRET=foo');
-    const result = await uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, '.env.local'), {
+    const result = await sendFileViewerLink(sendHtml, path.join(tmpDir, '.env.local'), {
       workdir: tmpDir,
       toolUseId: 'toolu_sensitive',
+      viewerBaseUrl: VIEWER_URL,
+      hmacSecret: HMAC,
     });
     expect(result).toBeNull();
-    expect(mockClient.uploadContent).not.toHaveBeenCalled();
-  });
-});
-
-describe('concurrency semaphore', () => {
-  let tmpDir;
-  let mockClient;
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'file-upload-conc-'));
-    for (let i = 0; i < 5; i++) {
-      writeFileSync(path.join(tmpDir, `file${i}.txt`), `content${i}`);
-    }
-    let resolvers = [];
-    mockClient = {
-      crypto: { encryptMedia: vi.fn() },
-      uploadContent: vi.fn(() => new Promise(resolve => {
-        resolvers.push(() => resolve('mxc://test/123'));
-      })),
-      sendMessage: vi.fn(async () => '$ev'),
-      _resolvers: resolvers,
-      _resolveAll: () => { while (resolvers.length) resolvers.shift()(); },
-    };
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it('limits concurrent uploads to 3', async () => {
-    const promises = [];
-    for (let i = 0; i < 5; i++) {
-      promises.push(uploadFileToRoom(mockClient, '!room:s', path.join(tmpDir, `file${i}.txt`), {
-        workdir: tmpDir,
-        toolUseId: `toolu_${i}`,
-      }));
-    }
-    // Wait a tick for the first 3 to start
-    await new Promise(r => setTimeout(r, 50));
-    // Should have exactly 3 pending uploadContent calls
-    expect(mockClient.uploadContent).toHaveBeenCalledTimes(3);
-
-    // Resolve all pending uploads
-    mockClient._resolveAll();
-    await new Promise(r => setTimeout(r, 50));
-    mockClient._resolveAll();
-    await Promise.all(promises);
-    expect(mockClient.uploadContent).toHaveBeenCalledTimes(5);
+    expect(sendHtml).not.toHaveBeenCalled();
   });
 });

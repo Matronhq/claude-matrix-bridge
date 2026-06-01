@@ -14,7 +14,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // Syntax highlighting via highlight.js CDN
-function renderHtml(filename, content) {
+function renderHtml(filename, content, token) {
   const escaped = content
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -32,14 +32,16 @@ function renderHtml(filename, content) {
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <style>
     body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
-    .header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 14px; }
+    .header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }
     .filename { font-weight: 600; }
+    .dl-btn { padding: 4px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; text-decoration: none; }
+    .dl-btn:hover { background: #2ea043; }
     pre { margin: 0; padding: 16px 20px; overflow-x: auto; }
     code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; line-height: 1.5; }
   </style>
 </head>
 <body>
-  <div class="header"><span class="filename">${filename}</span></div>
+  <div class="header"><span class="filename">${filename}</span>${token ? `<a class="dl-btn" href="/download?token=${encodeURIComponent(token)}">Download</a>` : ''}</div>
   <pre><code class="${langClass}">${escaped}</code></pre>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script>hljs.highlightAll();</script>
@@ -165,10 +167,30 @@ app.get('/view', async (req, res) => {
     const content = await fs.readFile(filePath, 'utf-8');
     const filename = path.basename(filePath);
 
-    res.type('html').send(renderHtml(filename, content));
+    res.type('html').send(renderHtml(filename, content, token));
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).send('File not found');
     console.error('Error reading file:', err);
+    res.status(500).send('Internal error');
+  }
+});
+
+app.get('/download', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
+
+  try {
+    const filePath = path.resolve(data.path);
+    const content = await fs.readFile(filePath);
+    const filename = path.basename(filePath);
+    res.set('Content-Disposition', `attachment; filename="${filename}"`);
+    res.type('application/octet-stream').send(content);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).send('File not found');
+    console.error('Error reading file for download:', err);
     res.status(500).send('Internal error');
   }
 });

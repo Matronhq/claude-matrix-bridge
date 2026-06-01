@@ -17,7 +17,7 @@ import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { uploadFileToRoom, logUploadDecision } from './lib/file-uploader.js';
+import { sendFileViewerLink, logFileDecision } from './lib/file-uploader.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -48,9 +48,9 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
-const FILE_UPLOAD_ENABLED = process.env.MATRON_FILE_UPLOAD !== '0';
-const FILE_UPLOAD_MAX_BYTES = (() => {
-  const n = parseInt(process.env.MATRON_FILE_UPLOAD_MAX_BYTES || '5242880', 10);
+const FILE_LINK_ENABLED = process.env.MATRON_FILE_LINK !== '0';
+const FILE_LINK_MAX_BYTES = (() => {
+  const n = parseInt(process.env.MATRON_FILE_LINK_MAX_BYTES || '5242880', 10);
   if (!Number.isFinite(n) || n <= 0) return 5242880;
   return n;
 })();
@@ -140,10 +140,10 @@ const LIVE_OUTPUT_TTL = Number.isFinite(_rawLiveOutputTtl) && _rawLiveOutputTtl 
 const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
 sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
-const pendingFileUploads = new Map();
+const pendingFileLinks = new Map();
 
-function fileUploadEnabled(session) {
-  return FILE_UPLOAD_ENABLED && (session.showFileUpload !== false);
+function fileLinkEnabled(session) {
+  return FILE_LINK_ENABLED && (session.showFileLink !== false);
 }
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
@@ -364,7 +364,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
-    showFileUpload: persistedForRoom?.showFileUpload !== false,
+    showFileLink: persistedForRoom?.showFileLink !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -435,8 +435,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Flush any remaining response
     flushResponse(session);
     // Clean up pending file uploads for this session
-    for (const [id, entry] of pendingFileUploads) {
-      if (entry.roomId === session.roomId) pendingFileUploads.delete(id);
+    for (const [id, entry] of pendingFileLinks) {
+      if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
     }
 
     if (sessions.get(roomId) === session) {
@@ -461,11 +461,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
-        restarted.showFileUpload = session.showFileUpload;
+        restarted.showFileLink = session.showFileLink;
         sessions.set(roomId, restarted);
         // Clean up pending file uploads for the dead session
-        for (const [id, entry] of pendingFileUploads) {
-          if (entry.roomId === session.roomId) pendingFileUploads.delete(id);
+        for (const [id, entry] of pendingFileLinks) {
+          if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
         }
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -599,7 +599,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
-    showFileUpload: persistedForRoom?.showFileUpload !== false,
+    showFileLink: persistedForRoom?.showFileLink !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -668,8 +668,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
     flushResponse(session);
-    for (const [id, entry] of pendingFileUploads) {
-      if (entry.roomId === session.roomId) pendingFileUploads.delete(id);
+    for (const [id, entry] of pendingFileLinks) {
+      if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
     }
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -692,10 +692,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
-        restarted.showFileUpload = session.showFileUpload;
+        restarted.showFileLink = session.showFileLink;
         sessions.set(roomId, restarted);
-        for (const [id, entry] of pendingFileUploads) {
-          if (entry.roomId === session.roomId) pendingFileUploads.delete(id);
+        for (const [id, entry] of pendingFileLinks) {
+          if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
         }
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -1650,16 +1650,16 @@ function handleClaudeEvent(session, event) {
             }
           }
 
-          // File-upload stash: track Write/Edit/MultiEdit for upload on tool_result
+          // File-link stash: track Write/Edit/MultiEdit for viewer link on tool_result
           if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit')
               && input.file_path) {
             const absPath = path.isAbsolute(input.file_path)
               ? input.file_path
               : path.join(session.workdir, input.file_path);
-            if (fileUploadEnabled(session)) {
-              pendingFileUploads.set(block.id, { filePath: absPath, roomId: session.roomId, workdir: session.workdir });
+            if (fileLinkEnabled(session)) {
+              pendingFileLinks.set(block.id, { filePath: absPath, roomId: session.roomId, workdir: session.workdir });
             } else {
-              logUploadDecision({ toolUseId: block.id, filePath: absPath, decision: 'skipped-disabled' });
+              logFileDecision({ toolUseId: block.id, filePath: absPath, decision: 'skipped-disabled' });
             }
           }
         }
@@ -1856,36 +1856,31 @@ function handleClaudeEvent(session, event) {
           if (block.type === 'tool_result' && block.is_error) {
             debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
           }
-          // File-upload fire: upload on successful tool_result
+          // File-link fire: send viewer link on successful tool_result
           if (block.type === 'tool_result' && block.tool_use_id) {
-            const pending = pendingFileUploads.get(block.tool_use_id);
+            const pending = pendingFileLinks.get(block.tool_use_id);
             if (pending) {
-              pendingFileUploads.delete(block.tool_use_id);
+              pendingFileLinks.delete(block.tool_use_id);
               if (block.is_error) {
-                logUploadDecision({ toolUseId: block.tool_use_id,
+                logFileDecision({ toolUseId: block.tool_use_id,
                   filePath: pending.filePath, decision: 'skipped-error',
                   error: 'tool_result is_error' });
               } else {
-                (async () => {
-                  try {
-                    const sess = sessions.get(pending.roomId);
-                    if (sess && !fileUploadEnabled(sess)) {
-                      logUploadDecision({ toolUseId: block.tool_use_id,
-                        filePath: pending.filePath, decision: 'skipped-disabled' });
-                      return;
-                    }
-                    const isEncrypted = await client.crypto.isRoomEncrypted(pending.roomId)
-                      .catch(() => ENCRYPT_SESSION_ROOMS);
-                    await uploadFileToRoom(client, pending.roomId, pending.filePath, {
-                      maxBytes: FILE_UPLOAD_MAX_BYTES,
-                      encrypt: isEncrypted,
-                      toolUseId: block.tool_use_id,
-                      workdir: pending.workdir,
-                    });
-                  } catch (err) {
-                    console.error(`[file-upload] Queue error for ${pending.filePath}: ${err.message}`);
-                  }
-                })();
+                const sess = sessions.get(pending.roomId);
+                if (sess && !fileLinkEnabled(sess)) {
+                  logFileDecision({ toolUseId: block.tool_use_id,
+                    filePath: pending.filePath, decision: 'skipped-disabled' });
+                } else if (sess) {
+                  sendFileViewerLink(sess.sendHtml, pending.filePath, {
+                    maxBytes: FILE_LINK_MAX_BYTES,
+                    toolUseId: block.tool_use_id,
+                    workdir: pending.workdir,
+                    viewerBaseUrl: VIEWER_BASE_URL,
+                    hmacSecret: HMAC_SECRET,
+                  }).catch(err => {
+                    console.error(`[file-link] Error for ${pending.filePath}: ${err.message}`);
+                  });
+                }
               }
             }
           }
@@ -2446,7 +2441,7 @@ const MATRON_COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
-  { command: 'file_upload', description: 'Toggle file attachment uploads' },
+  { command: 'file_link', description: 'Toggle viewer links for written files' },
   { command: 'help', description: 'Show all commands' },
 ];
 
@@ -3151,18 +3146,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
-    case '!file_upload':
-    case '!fileupload': {
+    case '!file_link':
+    case '!filelink': {
       const session = sessions.get(roomId);
       if (!session) {
         await sendReply('No active session.');
         break;
       }
-      session.showFileUpload = !session.showFileUpload;
+      session.showFileLink = !session.showFileLink;
       if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showFileUpload: session.showFileUpload });
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showFileLink: session.showFileLink });
       }
-      await sendReply(`fileUpload: ${session.showFileUpload ? 'ON' : 'OFF'} (effective immediately)`);
+      await sendReply(`fileLink: ${session.showFileLink ? 'ON' : 'OFF'} (effective immediately)`);
       break;
     }
 
@@ -3492,7 +3487,7 @@ client.on('room.message', async (roomId, event) => {
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
       'show_bash', 'show_bash_output', 'bash_output',
-      'file_upload', 'fileupload',
+      'file_link', 'filelink',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -4595,18 +4590,6 @@ async function main() {
   await client.start();
   console.log('Matrix client started, listening for messages...');
 
-  // Check homeserver media upload limit vs configured max
-  if (FILE_UPLOAD_ENABLED) {
-    try {
-      const mediaConfig = await client.doRequest('GET', '/_matrix/media/v3/config');
-      const serverLimit = mediaConfig?.['m.upload.size'];
-      if (serverLimit && FILE_UPLOAD_MAX_BYTES > serverLimit) {
-        console.warn(`[file-upload] MATRON_FILE_UPLOAD_MAX_BYTES (${FILE_UPLOAD_MAX_BYTES}) exceeds homeserver limit (${serverLimit}); uploads between ${serverLimit}-${FILE_UPLOAD_MAX_BYTES} bytes will fail with 413`);
-      } else if (serverLimit) {
-        console.log(`[file-upload] Homeserver media limit: ${serverLimit} bytes, client limit: ${FILE_UPLOAD_MAX_BYTES} bytes`);
-      }
-    } catch (e) { debug('[file-upload] Could not check homeserver media config:', e.message); }
-  }
 
   // Ensure all joined rooms have the Matron command state event (only if changed)
   try {
