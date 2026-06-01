@@ -448,9 +448,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        // Don't auto-restart if the workdir was removed (e.g. worktree
-        // cleaned up after merge). The session is legitimately over.
-        if (!fs.existsSync(cwd)) {
+        // Don't auto-restart if the workdir or worktree was removed (e.g.
+        // worktree cleaned up after merge). The session is legitimately over.
+        const cwdGone = !fs.existsSync(cwd);
+        const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
+        if (cwdGone || wtGone) {
           sessions.delete(roomId);
           const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
           if (session.sendCallback) session.sendCallback(notice);
@@ -530,8 +532,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const settings = {
     permissions: {
       allow: [
-        'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)',
-        'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
+        'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)',
+        'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)',
       ],
       deny: [],
     },
@@ -722,7 +724,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        if (!fs.existsSync(cwd)) {
+        const cwdGone = !fs.existsSync(cwd);
+        const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
+        if (cwdGone || wtGone) {
           sessions.delete(roomId);
           const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
           if (session.sendCallback) session.sendCallback(notice);
@@ -2845,6 +2849,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
+      if (worktree) {
+        for (const [rid, s] of sessions) {
+          if (s.alive && s.worktree === worktree && s.workdir === workdir) {
+            await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
+            return;
+          }
+        }
+      }
       const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
@@ -3015,9 +3027,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           }
           if (foundEntry) {
             const altEncoded = encodeProjectDir(foundEntry.workdir);
+            // Check base transcript path, then worktree transcript path
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (fs.existsSync(altFile)) {
+            const wtDir = foundEntry.worktree
+              ? path.join(os.homedir(), '.claude', 'projects', `${altEncoded}--claude-worktrees-${foundEntry.worktree}`)
+              : null;
+            const wtFile = wtDir ? path.join(wtDir, `${foundEntry.sessionId}.jsonl`) : null;
+            if (fs.existsSync(altFile) || (wtFile && fs.existsSync(wtFile))) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
             }
