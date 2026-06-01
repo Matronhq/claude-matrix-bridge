@@ -3071,7 +3071,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const args = text.replace(/^!\w+\s*/, '').trim().split(/\s+/).filter(Boolean);
       const senderRole = getUserRole(sender);
 
-      if (args.length === 0 || cmd === '!who' || args[0] === 'list') {
+      if (args.length === 0 && cmd === '!role') {
+        await sendReply(`${sender}: ${senderRole}`);
+      } else if (cmd === '!who' || (args.length > 0 && args[0] === 'list')) {
+        if (senderRole !== 'admin') {
+          await sendReply('Only admins can list all roles.');
+          break;
+        }
         const lines = [];
         const allUsers = new Set([...ALLOWED_USER_IDS, ...roles.keys()]);
         for (const uid of allUsers) {
@@ -3093,9 +3099,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           await sendReply('User must be a full Matrix ID (e.g. @user:server).');
           break;
         }
+        if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(targetUser)) {
+          await sendReply('Cannot assign roles to users outside the allowlist.');
+          break;
+        }
         if (newRole === 'member' && getUserRole(targetUser) === 'admin') {
-          const adminCount = Array.from(roles.values()).filter(r => r === 'admin').length;
-          if (adminCount <= 1) {
+          const allowedAdmins = (ALLOWED_USER_IDS.length > 0 ? ALLOWED_USER_IDS : [...roles.keys()])
+            .filter(uid => getUserRole(uid) === 'admin');
+          if (allowedAdmins.length <= 1) {
             await sendReply('Cannot demote the last admin.');
             break;
           }
