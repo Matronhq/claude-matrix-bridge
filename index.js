@@ -47,6 +47,7 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
+function encodeProjectDir(p) { return p.replace(/[/.]/g, '-'); }
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
@@ -501,7 +502,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
   if (session.claudeSessionId) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId });
+    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId, worktreeName: session.worktree });
     session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
     session.subagentWatcher.snapshot();
   }
@@ -580,7 +581,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
-  const encodedCwd = cwd.replace(/[/.]/g, '-');
+  const encodedCwd = encodeProjectDir(cwd);
   const worktreeTranscriptPath = worktreeName
     ? path.join(os.homedir(), '.claude', 'projects', `${encodedCwd}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`)
     : undefined;
@@ -1453,7 +1454,7 @@ function handleClaudeEvent(session, event) {
   // watcher up front. Decoupled from the id-capture block above so future
   // refactors can't silently lose the watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
+    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId, worktreeName: session.worktree });
     session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
     session.subagentWatcher.snapshot();
   }
@@ -2300,6 +2301,7 @@ function sessionEffectiveCwd(session) {
   if (session.worktree) {
     const wtPath = path.join(session.workdir, '.claude', 'worktrees', session.worktree);
     if (fs.existsSync(wtPath)) return wtPath;
+    throw new Error(`Worktree directory not found: ${wtPath}`);
   }
   return session.workdir;
 }
@@ -2643,7 +2645,7 @@ async function maybeUpdatePinnedSummary(session) {
 }
 
 function getSessionSummary(sessionId, workdir) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const encodedPath = encodeProjectDir(workdir || DEFAULT_WORKDIR);
   const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
@@ -2672,7 +2674,7 @@ function getSessionSummary(sessionId, workdir) {
  * This prevents sending duplicate tool_results which cause API 400 errors.
  */
 function hasToolResultInHistory(sessionId, workdir, toolUseId, worktreeName) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const encodedPath = encodeProjectDir(workdir || DEFAULT_WORKDIR);
   // Check both base workdir and worktree transcript paths
   const candidates = [path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)];
   if (worktreeName) {
@@ -2743,8 +2745,9 @@ async function buildMediaContentBlocks(event, session) {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
+    let imgPath;
+    try { imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
@@ -2752,8 +2755,9 @@ async function buildMediaContentBlocks(event, session) {
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
     });
   } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
+    let savePath;
+    try { savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
 
@@ -2954,7 +2958,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const prev = getPersistedSession(roomId);
       const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-      const encodedPath = resumeWorkdir.replace(/\//g, '-');
+      const encodedPath = encodeProjectDir(resumeWorkdir);
 
       const projectDir = path.join(projectsRoot, encodedPath);
 
@@ -3010,7 +3014,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             }
           }
           if (foundEntry) {
-            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+            const altEncoded = encodeProjectDir(foundEntry.workdir);
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
             if (fs.existsSync(altFile)) {
@@ -3228,7 +3232,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // with persisted sessions (which include worktree sessions that
       // have transcripts in different project dirs).
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-      const encodedPath = workdir.replace(/\//g, '-');
+      const encodedPath = encodeProjectDir(workdir);
       const projectDir = path.join(projectsRoot, encodedPath);
 
       const files = [];
