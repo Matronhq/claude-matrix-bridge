@@ -17,6 +17,7 @@ import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { sendFileViewerLink, logFileDecision } from './lib/file-uploader.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -47,6 +48,12 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
+const FILE_LINK_ENABLED = process.env.MATRON_FILE_LINK !== '0';
+const FILE_LINK_MAX_BYTES = (() => {
+  const n = parseInt(process.env.MATRON_FILE_LINK_MAX_BYTES || '5242880', 10);
+  if (!Number.isFinite(n) || n <= 0) return 5242880;
+  return n;
+})();
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
@@ -133,6 +140,11 @@ const LIVE_OUTPUT_TTL = Number.isFinite(_rawLiveOutputTtl) && _rawLiveOutputTtl 
 const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
 sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
+const pendingFileLinks = new Map();
+
+function fileLinkEnabled(session) {
+  return FILE_LINK_ENABLED && (session.showFileLink !== false);
+}
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
 }
@@ -143,13 +155,6 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath) {
-  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
-  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
-  return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
-}
 
 function generateActionLink(action, roomId, extras) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -352,6 +357,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
+    showFileLink: persistedForRoom?.showFileLink !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -421,6 +427,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 
     // Flush any remaining response
     flushResponse(session);
+    // Clean up pending file uploads for this session
+    for (const [id, entry] of pendingFileLinks) {
+      if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
+    }
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -444,7 +454,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.showFileLink = session.showFileLink;
         sessions.set(roomId, restarted);
+        // Clean up pending file uploads for the dead session
+        for (const [id, entry] of pendingFileLinks) {
+          if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
+        }
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -577,6 +592,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
+    showFileLink: persistedForRoom?.showFileLink !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -645,6 +661,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
     flushResponse(session);
+    for (const [id, entry] of pendingFileLinks) {
+      if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
+    }
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -666,7 +685,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.showFileLink = session.showFileLink;
         sessions.set(roomId, restarted);
+        for (const [id, entry] of pendingFileLinks) {
+          if (entry.roomId === session.roomId) pendingFileLinks.delete(id);
+        }
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -1548,30 +1571,12 @@ function handleClaudeEvent(session, event) {
             indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Write' && input.file_path) {
             isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Writing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Writing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Writing ${input.file_path}`;
-              indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
-            }
+            indicator = `✏️ Writing ${input.file_path}`;
+            indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Edit' && input.file_path) {
             isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Editing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Editing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Editing ${input.file_path}`;
-              indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
-            }
+            indicator = `✏️ Editing ${input.file_path}`;
+            indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
             indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
@@ -1617,6 +1622,19 @@ function handleClaudeEvent(session, event) {
               session.sendHtml(indicator, indicatorHtml);
             } else if (isKeyEvent && session.sendCallback) {
               session.sendCallback(indicator);
+            }
+          }
+
+          // File-link stash: track Write/Edit/MultiEdit for viewer link on tool_result
+          if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit')
+              && input.file_path) {
+            const absPath = path.isAbsolute(input.file_path)
+              ? input.file_path
+              : path.join(session.workdir, input.file_path);
+            if (fileLinkEnabled(session)) {
+              pendingFileLinks.set(block.id, { filePath: absPath, roomId: session.roomId, workdir: session.workdir });
+            } else {
+              logFileDecision({ toolUseId: block.id, filePath: absPath, decision: 'skipped-disabled' });
             }
           }
         }
@@ -1812,6 +1830,34 @@ function handleClaudeEvent(session, event) {
           }
           if (block.type === 'tool_result' && block.is_error) {
             debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
+          }
+          // File-link fire: send viewer link on successful tool_result
+          if (block.type === 'tool_result' && block.tool_use_id) {
+            const pending = pendingFileLinks.get(block.tool_use_id);
+            if (pending) {
+              pendingFileLinks.delete(block.tool_use_id);
+              if (block.is_error) {
+                logFileDecision({ toolUseId: block.tool_use_id,
+                  filePath: pending.filePath, decision: 'skipped-error',
+                  error: 'tool_result is_error' });
+              } else {
+                const sess = sessions.get(pending.roomId);
+                if (sess && !fileLinkEnabled(sess)) {
+                  logFileDecision({ toolUseId: block.tool_use_id,
+                    filePath: pending.filePath, decision: 'skipped-disabled' });
+                } else if (sess) {
+                  sendFileViewerLink(sess.sendHtml, pending.filePath, {
+                    maxBytes: FILE_LINK_MAX_BYTES,
+                    toolUseId: block.tool_use_id,
+                    workdir: pending.workdir,
+                    viewerBaseUrl: VIEWER_BASE_URL,
+                    hmacSecret: HMAC_SECRET,
+                  }).catch(err => {
+                    console.error(`[file-link] Error for ${pending.filePath}: ${err.message}`);
+                  });
+                }
+              }
+            }
           }
         }
       }
@@ -2370,6 +2416,7 @@ const MATRON_COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
+  { command: 'file_link', description: 'Toggle viewer links for written files' },
   { command: 'help', description: 'Show all commands' },
 ];
 
@@ -3074,6 +3121,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!file_link':
+    case '!filelink': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      session.showFileLink = !session.showFileLink;
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showFileLink: session.showFileLink });
+      }
+      await sendReply(`fileLink: ${session.showFileLink ? 'ON' : 'OFF'} (effective immediately)`);
+      break;
+    }
+
     case '!sessions': {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
@@ -3399,6 +3461,8 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
+      'show_bash', 'show_bash_output', 'bash_output',
+      'file_link', 'filelink',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -4500,6 +4564,7 @@ async function main() {
 
   await client.start();
   console.log('Matrix client started, listening for messages...');
+
 
   // Ensure all joined rooms have the Matron command state event (only if changed)
   try {

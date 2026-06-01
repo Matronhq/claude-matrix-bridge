@@ -14,12 +14,17 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // Syntax highlighting via highlight.js CDN
-function renderHtml(filename, content) {
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function renderHtml(filename, content, token) {
   const escaped = content
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
+  const safeFilename = escapeHtml(filename);
   const ext = path.extname(filename).slice(1);
   const langClass = ext ? `language-${ext}` : '';
 
@@ -28,18 +33,20 @@ function renderHtml(filename, content) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${filename}</title>
+  <title>${safeFilename}</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <style>
     body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
-    .header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 14px; }
+    .header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }
     .filename { font-weight: 600; }
+    .dl-btn { padding: 4px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; text-decoration: none; }
+    .dl-btn:hover { background: #2ea043; }
     pre { margin: 0; padding: 16px 20px; overflow-x: auto; }
     code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; line-height: 1.5; }
   </style>
 </head>
 <body>
-  <div class="header"><span class="filename">${filename}</span></div>
+  <div class="header"><span class="filename">${safeFilename}</span>${token ? `<a class="dl-btn" href="/download?token=${encodeURIComponent(token)}">Download</a>` : ''}</div>
   <pre><code class="${langClass}">${escaped}</code></pre>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script>hljs.highlightAll();</script>
@@ -152,6 +159,81 @@ function renderSensitiveData(label, content) {
 </html>`;
 }
 
+// Sensitive-path denylist (mirrors lib/file-uploader.js at serve time)
+const SENSITIVE_BASENAME_RE = [
+  /\.env(\..*)?$/i, /secrets?\.(json|ya?ml|toml|txt)$/i, /^credentials$/i,
+  /credentials?\.(json|ya?ml|toml|txt)$/i, /\.(pem|key|p12|pfx|jks|keystore)$/i,
+  /id_rsa|id_ed25519|id_ecdsa/i, /\.npmrc$/i, /\.netrc$/i,
+  /token(s)?\.(json|txt)$/i, /service[-_]?account.*\.json$/i, /\.htpasswd$/i,
+  /^config\.json$/i,
+];
+const SENSITIVE_PATH_RE = [/\/\.aws\//i, /\/\.docker\//i, /\/\.kube\//i, /\/\.ssh\//i, /\/\.gnupg\//i];
+function isSensitivePath(p) {
+  const bn = path.basename(p);
+  return SENSITIVE_BASENAME_RE.some(r => r.test(bn)) || SENSITIVE_PATH_RE.some(r => r.test(p));
+}
+
+// Re-enforce file policy at serve time. The signed token carries the policy
+// context (workdir, maxBytes) from link creation; we re-check here to defend
+// against TOCTOU (symlink swap, file growth between link creation and click).
+//
+// Opens with O_NOFOLLOW to reject symlinks, then validates the opened fd's
+// real path via /proc/self/fd for scope and sensitivity checks.
+import { constants as fsConstants } from 'fs';
+async function validateAndOpen(data) {
+  const filePath = path.resolve(data.path);
+
+  // Open with O_NOFOLLOW — rejects symlinks at the final component
+  let fh, stat;
+  try {
+    fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    stat = await fh.stat();
+  } catch (err) {
+    if (fh) await fh.close().catch(() => {});
+    if (err.code === 'ELOOP') return { error: 'Symlinks not allowed', status: 403 };
+    return { error: err.code === 'ENOENT' ? 'File not found' : 'Internal error', status: err.code === 'ENOENT' ? 404 : 500 };
+  }
+
+  if (!stat.isFile()) {
+    await fh.close().catch(() => {});
+    return { error: 'Not a regular file', status: 403 };
+  }
+
+  // Resolve the opened fd's real path via procfs — this is the actual file
+  // the kernel opened, immune to post-open path swaps
+  let realPath;
+  try {
+    realPath = await fs.readlink(`/proc/self/fd/${fh.fd}`);
+  } catch {
+    realPath = filePath;
+  }
+
+  // Workdir scope check against the opened fd's real path
+  if (data.workdir) {
+    let realWorkdir;
+    try { realWorkdir = await fs.realpath(data.workdir); }
+    catch { realWorkdir = data.workdir; }
+    if (realPath !== realWorkdir && !realPath.startsWith(realWorkdir + '/')) {
+      await fh.close().catch(() => {});
+      return { error: 'Access denied', status: 403 };
+    }
+  }
+
+  // Sensitivity check against both the token path and the opened real path
+  if (isSensitivePath(filePath) || isSensitivePath(realPath)) {
+    await fh.close().catch(() => {});
+    return { error: 'Access denied', status: 403 };
+  }
+
+  const maxBytes = data.maxBytes || 5242880;
+  if (stat.size > maxBytes) {
+    await fh.close().catch(() => {});
+    return { error: 'File too large', status: 413 };
+  }
+
+  return { fh, filePath, size: stat.size };
+}
+
 app.get('/view', async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
@@ -159,16 +241,41 @@ app.get('/view', async (req, res) => {
   const data = verifyToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
 
-  try {
-    // Resolve and prevent path traversal
-    const filePath = path.resolve(data.path);
-    const content = await fs.readFile(filePath, 'utf-8');
-    const filename = path.basename(filePath);
+  const result = await validateAndOpen(data);
+  if (result.error) return res.status(result.status).send(result.error);
 
-    res.type('html').send(renderHtml(filename, content));
+  try {
+    const content = await result.fh.readFile('utf-8');
+    await result.fh.close();
+    const filename = path.basename(result.filePath);
+    res.type('html').send(renderHtml(filename, content, token));
   } catch (err) {
-    if (err.code === 'ENOENT') return res.status(404).send('File not found');
+    await result.fh.close().catch(() => {});
     console.error('Error reading file:', err);
+    res.status(500).send('Internal error');
+  }
+});
+
+app.get('/download', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
+
+  const result = await validateAndOpen(data);
+  if (result.error) return res.status(result.status).send(result.error);
+
+  try {
+    const content = await result.fh.readFile();
+    await result.fh.close();
+    const filename = path.basename(result.filePath);
+    const safeFilename = filename.replace(/[\\"\r\n]/g, '_');
+    res.set('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.type('application/octet-stream').send(content);
+  } catch (err) {
+    await result.fh.close().catch(() => {});
+    console.error('Error reading file for download:', err);
     res.status(500).send('Internal error');
   }
 });
