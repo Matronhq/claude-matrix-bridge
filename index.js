@@ -562,14 +562,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
-  // Worktree is not supported in iv-mode: the transcript tail derives
-  // its path from cwd, but --worktree changes Claude's actual cwd to a
-  // worktree directory. The tail would read the wrong JSONL. Reject
-  // worktree requests in iv-mode until transcript routing is implemented.
   const worktreeName = options.worktree || persistedForRoom?.worktree || null;
-  if (worktreeName) {
-    throw new Error('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
-  }
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
@@ -587,13 +580,19 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
-  debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
+  const encodedCwd = cwd.replace(/[/.]/g, '-');
+  const worktreeTranscriptPath = worktreeName
+    ? path.join(os.homedir(), '.claude', 'projects', `${encodedCwd}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`)
+    : undefined;
+
+  debug(`Spawning interactive claude session ${sessionId} in ${cwd}${worktreeName ? ` (worktree: ${worktreeName})` : ''}`);
 
   const iv = createInteractiveSession({
     roomId,
     workdir: cwd,
     sessionId,
     claudeArgs,
+    transcriptPath: worktreeTranscriptPath,
     env: {
       ...process.env,
       PATH: pathWithNode,
@@ -642,7 +641,32 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pinnedSummaryText: '',
     pendingWelcome: true,
     pendingInteractivePrompt: null,
+    ivReady: false,
+    ivPendingInput: null,
   };
+
+  function markIvReady() {
+    if (session.ivReady) return;
+    session.ivReady = true;
+    debug(`[IV] Session marked ready, pending input: ${!!session.ivPendingInput}`);
+    if (session.ivPendingInput) {
+      const pending = session.ivPendingInput;
+      session.ivPendingInput = null;
+      sendToSession(session, pending);
+    }
+  }
+
+  let _ivPtyBuf = '';
+  iv.on('pty-data', chunk => {
+    if (session.ivReady) return;
+    _ivPtyBuf += chunk;
+    if (_ivPtyBuf.length > 4096) _ivPtyBuf = _ivPtyBuf.slice(-2048);
+    if (_ivPtyBuf.includes('/effort')) {
+      debug('[IV] Detected toolbar in PTY output — TUI is ready');
+      _ivPtyBuf = '';
+      markIvReady();
+    }
+  });
 
   iv.on('event', event => {
     debug('IV event:', event.type);
@@ -656,6 +680,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
+    markIvReady();
     session.pendingInteractivePrompt = prompt;
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
@@ -807,8 +832,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   };
 
+  const readyTimer = setTimeout(() => {
+    if (!session.ivReady) {
+      debug('[IV] Readiness timeout (30s) — forcing ready');
+      markIvReady();
+    }
+  }, 30000);
+  if (typeof readyTimer.unref === 'function') readyTimer.unref();
+
   // Subagent activity watcher — see createSession() for the rationale.
-  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId });
+  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId, worktreeName });
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
   session.subagentWatcher.snapshot();
 
