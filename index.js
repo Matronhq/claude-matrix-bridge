@@ -15,7 +15,10 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import {
+  buildMcpServers, extractMcpExtraFlags, knownMcpExtras,
+  mergeMcpConfigs, parseDefaultExtras, resolveExtras,
+} from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -76,7 +79,23 @@ const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 // Per opt-in combination we write a separate generated file (`.mcp-config-
 // generated[.<extras>].json`) and pass its path to claude. Each browser stack
 // is ~400M resident, so defaulting to none keeps lightweight sessions lean.
-const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+function loadLocalMcpOverlay() {
+  const p = path.join(__dirname, 'mcp-config.local.json');
+  if (!fs.existsSync(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch (e) {
+    console.warn(`[mcp-config] Ignoring malformed mcp-config.local.json: ${e.message}`);
+    return null;
+  }
+}
+const RAW_MCP_CONFIG = mergeMcpConfigs(
+  JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8')),
+  loadLocalMcpOverlay(),
+);
+const KNOWN_MCP_EXTRAS = knownMcpExtras(RAW_MCP_CONFIG);
+// Per-machine baseline of extras applied to every session (e.g. "circleci").
+const DEFAULT_MCP_EXTRAS = parseDefaultExtras(process.env.MCP_DEFAULT_EXTRAS);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -99,11 +118,10 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
-// Sanity check: make sure the bridge's known extras stay in sync with what
-// the config file declares.
-for (const ex of knownMcpExtras()) {
-  if (!RAW_MCP_CONFIG.mcpExtras?.[ex]) {
-    console.warn(`[mcp-config] Flag --${ex} is recognised but no matching mcpExtras block exists; sessions opting in will get no extra servers.`);
+// Warn if a machine default names an extra that no config block defines.
+for (const ex of DEFAULT_MCP_EXTRAS) {
+  if (!KNOWN_MCP_EXTRAS.includes(ex)) {
+    console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
   }
 }
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
@@ -2819,7 +2837,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1), KNOWN_MCP_EXTRAS);
       const arg = positional[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
@@ -2869,7 +2887,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       // Confirm in origin room with a link to the new room
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
+      const effectiveStartExtras = resolveExtras(DEFAULT_MCP_EXTRAS, mcpExtras);
+      const extrasNote = effectiveStartExtras.length > 0 ? ` (extras: ${effectiveStartExtras.join(', ')})` : '';
       await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
 
       // Welcome message will be sent when user joins (see room.join handler)
@@ -2907,7 +2926,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // session ID. Passing no flags preserves whatever extras the session
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
-      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1), KNOWN_MCP_EXTRAS);
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
@@ -2928,8 +2947,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (restartSessionId) {
         persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
       }
-      const extrasLine = effectiveRestartExtras.length > 0
-        ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
+      const shownRestartExtras = resolveExtras(DEFAULT_MCP_EXTRAS, effectiveRestartExtras);
+      const extrasLine = shownRestartExtras.length > 0
+        ? `\nExtras: ${shownRestartExtras.join(', ')}`
         : '';
       await sendReply(
         `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
@@ -2943,7 +2963,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeTokens } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: resumeExtras, rest: resumeTokens } = extractMcpExtraFlags(parts.slice(1), KNOWN_MCP_EXTRAS);
       const resumeArg = resumeTokens[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
@@ -3074,7 +3094,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirTokens } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: workdirExtras, rest: workdirTokens } = extractMcpExtraFlags(parts.slice(1), KNOWN_MCP_EXTRAS);
       const newDir = workdirTokens.join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
