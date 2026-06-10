@@ -16,6 +16,7 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -3648,6 +3649,24 @@ client.on('room.message', async (roomId, event) => {
     // The value is already the button label, so resolveQuestionAnswer will use it as-is
   }
 
+  // Liveness guard: if this is an ask_user MCP gate whose poller has gone
+  // (crashed/disconnected) before the bridge's expiry timer fires, expire it
+  // now so this message falls through to Claude instead of being swallowed as
+  // a stale answer no poller will collect. The on-time path stays owned by the
+  // POST /ask expiry timer; this only covers early poller death.
+  if (typeof session.waitingForAnswer === 'string' && session.waitingForAnswer.startsWith('mcp:')) {
+    const qid = session.waitingForAnswer.slice(4);
+    if (isMcpQuestionAbandoned(pendingMcpQuestions.get(qid), Date.now())) {
+      if (pendingMcpQuestions.has(qid)) {
+        expireMcpQuestion(qid); // posts the "moved on" notice and clears the gate
+      } else {
+        // Defensive: gate armed but the question is already gone — just release.
+        session.waitingForAnswer = null;
+        session.pendingQuestions = null;
+      }
+    }
+  }
+
   // If Claude Code asked a question, handle the answer
   if (session.waitingForAnswer) {
     const q = session.pendingQuestions?.[0];
@@ -4104,6 +4123,11 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Question not found' }));
       return;
     }
+    // Stamp each poll so the liveness guard can tell the MCP server is still
+    // waiting. When polling stops early (crash/disconnect), this goes stale and
+    // the message handler expires the gate instead of swallowing the next
+    // message — before the bridge's own expiry timer would fire.
+    q.lastPolledAt = Date.now();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null, expired: q.expired || false }));
     // Terminal states (answered or bridge-expired): cancel the expiry timer
@@ -4195,6 +4219,9 @@ const apiServer = createServer(async (req, res) => {
           question, header, options, roomId,
           answered: false, answer: null,
           expired: false, expiryTimer,
+          // Seed the poll stamp so the liveness guard counts the question as
+          // live during the ~500ms before the MCP server's first poll arrives.
+          lastPolledAt: Date.now(),
         });
 
         const activeSession = sessions.get(roomId);
