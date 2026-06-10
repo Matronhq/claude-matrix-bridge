@@ -3372,13 +3372,29 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!model': {
       const session = sessions.get(roomId);
-      if (session?.initData) {
-        const model = session.initData.model || '(unknown)';
-        const version = session.initData.claude_code_version || '(unknown)';
-        const fast = session.initData.fast_mode_state || 'off';
-        await sendReply(`Model: ${model}\nClaude Code: v${version}\nFast mode: ${fast}`);
-      } else {
+      if (!session || !session.alive) {
         await sendReply('No active session. Start a session to see model info.');
+        break;
+      }
+      const arg = parts[1];
+      if (arg) {
+        switchModelInSession(session, arg, sendReply);
+        break;
+      }
+      const current = session.currentModel || session.initData?.model || null;
+      const extra = session.initData
+        ? `\nClaude Code: v${session.initData.claude_code_version || '(unknown)'}\nFast mode: ${session.initData.fast_mode_state || 'off'}`
+        : '';
+      const currentLine = current ? `Current model: ${current}` : 'Current model: (appears after the first reply)';
+      if (session.iv && session.sendButtonMessage) {
+        const buttons = modelButtons();
+        const plain = `${currentLine}${extra}\n\nTap a model to switch, or type /model <name>.`;
+        const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+        const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+          `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+        session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+      } else {
+        await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
       }
       break;
     }
