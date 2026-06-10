@@ -43,6 +43,19 @@ describe('switchModelInSession', () => {
     expect(s._sent.join(' ')).toMatch(/interactive mode/);
     expect(s._sent.join(' ')).toMatch(/claude-opus-4-8/);
   });
+
+  it('does not falsely confirm when the PTY write fails (dead session)', () => {
+    const sent = [];
+    const session = {
+      currentModel: null,
+      // A dead iv session: sendText returns false and writes nothing.
+      iv: { alive: false, sendText: () => false },
+    };
+    const ok = switchModelInSession(session, 'sonnet', (m) => sent.push(m));
+    expect(ok).toBe(false);
+    expect(sent.join(' ')).not.toMatch(/Switching to/);
+    expect(sent.join(' ')).toMatch(/isn't accepting input|couldn't|could not/i);
+  });
 });
 
 describe('modelButtons', () => {
