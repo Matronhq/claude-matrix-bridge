@@ -3659,6 +3659,13 @@ client.on('room.message', async (roomId, event) => {
       return;
     }
 
+    // Model picker button (no-arg /model) — value is `model:<alias>`.
+    const modelMatch = value.match(/^model:(.+)$/);
+    if (modelMatch) {
+      switchModelInSession(session, modelMatch[1], sendReply);
+      return;
+    }
+
     // Otherwise treat as a question answer — fall through to waitingForAnswer handling
     // The value is already the button label, so resolveQuestionAnswer will use it as-is
   }
