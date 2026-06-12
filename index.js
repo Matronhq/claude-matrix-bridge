@@ -113,7 +113,7 @@ const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedi
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
-const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
+let SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
   const match = hostname.match(/^(\w+)-(\d+)/);
   if (match) return match[2]; // Just the number
@@ -2552,6 +2552,7 @@ const MATRON_COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
+  { command: 'label', description: 'Show or set server label for room names' },
   { command: 'help', description: 'Show all commands' },
 ];
 
@@ -3202,6 +3203,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!label': {
+      const newLabel = text.replace(/^!\w+\s*/, '').trim();
+      if (!newLabel) {
+        await sendReply(`Current server label: ${SERVER_LABEL}`);
+      } else if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(sender)) {
+        await sendReply('Only allowed users can change the server label.');
+      } else if (!/^[A-Za-z0-9_. -]{1,16}$/.test(newLabel)) {
+        await sendReply('Label must be 1-16 characters: letters, numbers, spaces, _ . -');
+      } else {
+        SERVER_LABEL = newLabel;
+        await sendReply(`Server label set to: ${SERVER_LABEL}`);
+      }
+      break;
+    }
+
     case '!status': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3344,6 +3360,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/tools — List available tools\n` +
+        `/label [name] — Show or set the server label for room names\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
@@ -3378,6 +3395,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/tools', 'List available tools'],
+          ['/label [name]', 'Show or set the server label for room names'],
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
@@ -3633,6 +3651,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
+      'label',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
