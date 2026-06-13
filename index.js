@@ -621,9 +621,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     handleInteractiveScreenUpdate(session, update);
   });
 
+  iv.on('unclassified-prompt', update => {
+    debug('IV unclassified-prompt: surfacing best-effort');
+    handleUnclassifiedPrompt(session, update);
+  });
+
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
     session.pendingInteractivePrompt = prompt;
+    // A real structured prompt supersedes any best-effort unclassified-prompt
+    // notice we may have surfaced for an earlier render of this screen.
+    session.pendingUnclassifiedPrompt = false;
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -715,6 +723,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    // The turn ended, so any best-effort unclassified-prompt notice is stale.
+    session.pendingUnclassifiedPrompt = false;
     // A real turn-end supersedes any armed operator-compact fallback: disarm
     // it so a later (or stale) manual compact_boundary can't stand in as a
     // turn-end for a subsequent turn and clear busy out from under it.
@@ -783,7 +793,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 }
 
 // Surface a detected TUI prompt to Matrix as a multiple-choice question.
-function handleInteractivePrompt(session, prompt) {
+async function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
   // Prefer native buttons when the prompt is a clean selection menu and a
   // button channel is wired. promptButtons returns null for free-text /
@@ -800,8 +810,11 @@ function handleInteractivePrompt(session, prompt) {
       const html = `<b>🟡 Claude is asking:</b>` +
         (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
         `<br/><br/>${htmlOpts}`;
-      session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
-      return;
+      // sendButtonMessage returns null if the Matrix send fails. Fall through
+      // to the text rendering below in that case so the prompt is never
+      // silently dropped while the TUI waits for an answer.
+      const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      if (sent != null) return;
     }
   }
   const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
@@ -1066,6 +1079,43 @@ function handleInteractiveScreenUpdate(session, update) {
     const note = '↵ (auto-pressed Enter to continue)';
     if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
     else if (session.sendCallback) session.sendCallback(note);
+  }
+}
+
+// Safety net for iv-mode: the detector emits `unclassified-prompt` when the
+// settled screen looks like a selection menu it couldn't parse into buttons
+// (e.g. option labels too long). Without this the user would be blind while the
+// TUI waits. Surface a best-effort, cleaned screen dump so they can answer; a
+// later bare number/letter reply is sent as raw keystrokes (see the message
+// handler) to drive the open menu. Detector-side dedup prevents repeats.
+function handleUnclassifiedPrompt(session, { screen }) {
+  if (!session.sendHtml && !session.sendCallback) return;
+  // Clean the raw screen: drop blank lines, keep the tail (the menu sits at the
+  // bottom), and cap length so we don't dump the whole terminal.
+  const cleaned = String(screen || '')
+    .split('\n')
+    .map(l => l.replace(/\s+$/, ''))
+    .filter(l => l.trim().length > 0)
+    .slice(-20)
+    .join('\n')
+    .slice(0, 1500);
+  if (!cleaned) return;
+  const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number (or text) to answer:\n\n${cleaned}`;
+  const html =
+    `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
+    `Reply with the option number (or text) to answer:<br/><pre>${escapeHtml(cleaned)}</pre>`;
+  if (session.sendHtml) session.sendHtml(plain, html);
+  else session.sendCallback(plain);
+  session.pendingUnclassifiedPrompt = true;
+  // Like a structured prompt, this means claude is awaiting the user — clear
+  // busy so the reply is typed into the PTY instead of dropping into the queue.
+  if (session.busy) {
+    session.busy = false;
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
   }
 }
 
@@ -3725,21 +3775,34 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
-  // iv-mode: route reply to a pending TUI prompt before treating it as a
-  // normal message. If we consumed it as a prompt response, return.
+  // iv-mode: route a typed reply to a pending TUI prompt before treating it as
+  // a normal message. If we consumed it as a prompt response, return.
   //
-  // Skip this for button responses: TUI prompts are only ever surfaced as text
-  // (handleInteractivePrompt never uses buttons), so a button tap is an
-  // explicit bridge action (effort:/model:/interrupt/cancel:), never a prompt
-  // answer. Without this guard, tapping an effort/model picker while a TUI
-  // prompt is pending — e.g. the "Change effort level?" confirm raised by a
-  // prior effort tap — hits maybeResolve's unmatched path, which nulls
-  // pendingInteractivePrompt WITHOUT answering the TUI and falls through, so
-  // the button value then types a stray /effort|/model into the still-open
-  // menu, desyncing the PTY and dropping the real confirmation.
+  // Skip this for button responses. A prompt surfaced as buttons (prompt-opt:)
+  // is answered by the dedicated dispatch below, not here; and other button
+  // actions (effort:/model:/interrupt/cancel:) are never prompt answers.
+  // Without this guard, tapping an effort/model picker while a TUI prompt is
+  // pending — e.g. the "Change effort level?" confirm raised by a prior effort
+  // tap — hits maybeResolve's unmatched path, which nulls pendingInteractivePrompt
+  // WITHOUT answering the TUI and falls through, so the button value then types
+  // a stray /effort|/model into the still-open menu, desyncing the PTY.
   const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
     return;
+  }
+
+  // Best-effort reply to a detector-missed menu surfaced via
+  // handleUnclassifiedPrompt: a bare number/letter is sent as raw keystrokes
+  // (sendText's bracketed paste wouldn't drive an open TUI selection). Anything
+  // else clears the flag and routes as a normal message.
+  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse) {
+    session.pendingUnclassifiedPrompt = false;
+    const sel = text.trim();
+    if (/^\d{1,3}$/.test(sel) || /^[a-zA-Z]$/.test(sel)) {
+      for (const ch of sel) session.iv.sendKeystroke(ch);
+      session.iv.sendKeystroke('enter');
+      return;
+    }
   }
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
