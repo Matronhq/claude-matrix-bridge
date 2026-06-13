@@ -3795,6 +3795,9 @@ client.on('room.message', async (roomId, event) => {
   // a stray /effort|/model into the still-open menu, desyncing the PTY.
   const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
+    // Answering a classified prompt also retires any stale best-effort
+    // unclassified-prompt gate, so later messages aren't wrongly intercepted.
+    session.pendingUnclassifiedPrompt = false;
     return;
   }
 
@@ -3812,12 +3815,14 @@ client.on('room.message', async (roomId, event) => {
     const sel = text.trim();
     if (/^\d{1,3}$/.test(sel)) {
       session.pendingUnclassifiedPrompt = false;
-      session.iv.respondToPrompt({ kind: 'numbered', key: sel });
+      // Don't reset the detector dedup — the just-answered screen may linger a
+      // moment, and resetting would let it re-emit unclassified-prompt.
+      session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
       return;
     }
     if (/^[a-zA-Z]$/.test(sel)) {
       session.pendingUnclassifiedPrompt = false;
-      session.iv.respondToPrompt({ kind: 'lettered', key: sel });
+      session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
       return;
     }
     const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
@@ -3902,6 +3907,8 @@ client.on('room.message', async (roomId, event) => {
       const resp = p ? promptResponseForButton(p, Number(promptOptMatch[1])) : null;
       if (p && resp && session.iv && session.iv.alive) {
         session.pendingInteractivePrompt = null;
+        // Answering also retires any stale unclassified-prompt gate.
+        session.pendingUnclassifiedPrompt = false;
         session.iv.respondToPrompt(resp);
       }
       return;
