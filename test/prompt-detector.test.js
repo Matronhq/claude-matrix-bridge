@@ -995,6 +995,33 @@ describe('looksLikeUnclassifiedMenu', () => {
   });
 });
 
+describe('classifyScreen — option descriptions (AskUserQuestion-style)', () => {
+  const screen = [
+    'What would you like me to do?',
+    '1. Everything actionable',
+    '   All of the above plus the export fix and nav redirect.',
+    '2. Just the blockers',
+    '   Only the CI fix and styles storage.',
+    '3. Type something.',
+  ].join('\n');
+
+  it('captures each option header plus its indented description', () => {
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[0].label).toBe('Everything actionable');
+    expect(r.options[0].description).toContain('All of the above plus the export fix');
+    expect(r.options[1].label).toBe('Just the blockers');
+    expect(r.options[1].description).toContain('Only the CI fix and styles storage');
+    // Last option has no description line.
+    expect(r.options[2].label).toBe('Type something.');
+    expect(r.options[2].description).toBeUndefined();
+    // "Type something." is detected as the free-text slot.
+    expect(r.freeTextIdx).toBe(2);
+  });
+});
+
 describe('isIdleReadyScreen', () => {
   it('returns false for an empty / pre-render screen', () => {
     expect(isIdleReadyScreen('')).toBe(false);

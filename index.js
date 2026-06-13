@@ -804,9 +804,20 @@ async function handleInteractivePrompt(session, prompt) {
     const b = promptButtons(prompt);
     if (b) {
       const header = prompt.question || 'Claude is asking';
+      // Include each option's description (when the detector captured one, e.g.
+      // AskUserQuestion menus) so the user has the per-option detail before
+      // choosing — the buttons themselves only carry the short label.
+      const descOf = (i) => (prompt.options && prompt.options[i] && prompt.options[i].description) || '';
       const plain = ['Claude is asking:', prompt.question || '', '',
-        ...b.buttons.map((bt, i) => `${i + 1}. ${bt.label}`)].filter(Boolean).join('\n');
-      const htmlOpts = b.buttons.map(bt => `<b>${escapeHtml(bt.label)}</b>`).join(' · ');
+        ...b.buttons.map((bt, i) => {
+          const d = descOf(i);
+          return `${i + 1}. ${bt.label}${d ? `\n    ${d}` : ''}`;
+        })].filter(Boolean).join('\n');
+      const anyDesc = b.buttons.some((_, i) => descOf(i));
+      const htmlOpts = b.buttons.map((bt, i) => {
+        const d = descOf(i);
+        return `<b>${i + 1}. ${escapeHtml(bt.label)}</b>${d ? `<br/><i>${escapeHtml(d)}</i>` : ''}`;
+      }).join(anyDesc ? '<br/>' : ' · ');
       const html = `<b>🟡 Claude is asking:</b>` +
         (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
         `<br/><br/>${htmlOpts}`;
@@ -824,7 +835,8 @@ async function handleInteractivePrompt(session, prompt) {
   // (e.g. arrived during the button send above) or it was already resolved.
   // Don't post a stale text prompt against the current TUI menu.
   if (session.pendingInteractivePrompt !== prompt) return;
-  const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
+  const optionLines = prompt.options.map((opt, i) =>
+    `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}${opt.description ? `\n    ${opt.description}` : ''}`);
   // When the prompt has a detected free-text slot (e.g. "Tell Claude what
   // to change"), tell the user they can reply with text directly. We'll
   // route the reply to that option and pipe their text into the TUI.
@@ -846,7 +858,8 @@ async function handleInteractivePrompt(session, prompt) {
   ].filter(Boolean).join('\n');
   if (session.sendHtml) {
     const htmlOptions = prompt.options.map((opt, i) =>
-      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}`
+      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}` +
+      (opt.description ? `<br/>&nbsp;&nbsp;&nbsp;&nbsp;<i>${escapeHtml(opt.description)}</i>` : '')
     ).join('<br/>');
     const helpHtml =
       `Reply with the option number (1–${prompt.options.length})` +
