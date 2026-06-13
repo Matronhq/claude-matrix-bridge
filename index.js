@@ -16,8 +16,9 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
-import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { modelFromEvent, VALID_ALIAS_HINT, aliasLabel } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { parseModelDefaultCommand, resolveSpawnModel, readSpawnModel, writeSpawnModel } from './lib/spawn-model.js';
 import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -66,6 +67,21 @@ const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+// Bridge-wide config (spawn-default model, etc.), separate from per-room session state.
+const BRIDGE_CONFIG_PATH = path.join(os.homedir(), '.claude-matrix-config.json');
+
+// `--model <x>` args for a FRESH spawn (or [] to let Claude use its own
+// account/provider default). Only applied to new sessions — resumed sessions
+// keep whatever model their transcript was saved with. Opt-in by design: no
+// override means no --model, so Bedrock/Vertex/custom-gateway installs spawn.
+function spawnModelArgs(resumeSessionId) {
+  if (resumeSessionId) return [];
+  const model = resolveSpawnModel({
+    persisted: readSpawnModel(BRIDGE_CONFIG_PATH),
+    env: process.env.BRIDGE_CLAUDE_MODEL,
+  });
+  return model ? ['--model', model] : [];
+}
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -322,6 +338,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       },
     }),
   ];
+  args.push(...spawnModelArgs(resumeSessionId));
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
   }
@@ -543,6 +560,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
+  claudeArgs.push(...spawnModelArgs(resumeSessionId));
   claudeArgs.push(
     '--dangerously-skip-permissions',
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -3444,9 +3462,33 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     }
 
     case '!model': {
+      // `model default ...` manages the global spawn-default for NEW sessions.
+      // It works regardless of whether this room has a live session.
+      if ((parts[1] || '').toLowerCase() === 'default') {
+        const parsed = parseModelDefaultCommand(parts.slice(2));
+        if (parsed.action === 'invalid') {
+          await sendReply(parsed.message);
+        } else if (parsed.action === 'set') {
+          writeSpawnModel(BRIDGE_CONFIG_PATH, parsed.value);
+          await sendReply(`New sessions will start as ${aliasLabel(parsed.value)} (${parsed.value}). Existing sessions are unchanged — use "/model <name>" to switch one now.`);
+        } else if (parsed.action === 'reset') {
+          writeSpawnModel(BRIDGE_CONFIG_PATH, null);
+          const envPin = resolveSpawnModel({ persisted: null, env: process.env.BRIDGE_CLAUDE_MODEL });
+          await sendReply(envPin
+            ? `Spawn-default override cleared. BRIDGE_CLAUDE_MODEL still pins new sessions to ${envPin}.`
+            : `Spawn-default cleared — new sessions will use Claude's own default model.`);
+        } else {
+          const eff = resolveSpawnModel({ persisted: readSpawnModel(BRIDGE_CONFIG_PATH), env: process.env.BRIDGE_CLAUDE_MODEL });
+          await sendReply(eff
+            ? `New sessions start as: ${eff}\nChange with "/model default <name>", clear with "/model default reset".`
+            : `No spawn-default set — new sessions use Claude's own default model.\nSet one with "/model default <name>" (e.g. /model default opus[1m]).`);
+        }
+        break;
+      }
+
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
-        await sendReply('No active session. Start a session to see model info.');
+        await sendReply('No active session. Start a session to see or switch the model.\n(Use "/model default <name>" to set what new sessions start as.)');
         break;
       }
       const arg = parts[1];
@@ -3455,6 +3497,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
+      const spawnDefault = resolveSpawnModel({ persisted: readSpawnModel(BRIDGE_CONFIG_PATH), env: process.env.BRIDGE_CLAUDE_MODEL });
+      const defaultLine = spawnDefault ? `\nNew sessions start as: ${spawnDefault}` : '';
       const extra = session.initData
         ? `\nClaude Code: v${session.initData.claude_code_version || '(unknown)'}\nFast mode: ${session.initData.fast_mode_state || 'off'}`
         : '';
@@ -3465,16 +3509,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // auto-started sessions) — never claim "needs interactive mode" here.
         if (session.sendButtonMessage) {
           const buttons = modelButtons();
-          const plain = `${currentLine}${extra}\n\nTap a model to switch, or type /model <name>.`;
+          const plain = `${currentLine}${defaultLine}${extra}\n\nTap a model to switch this session, or type /model <name>. Set the new-session default with /model default <name>.`;
           const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
-            `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${defaultLine ? '<br/>' + escapeHtml(defaultLine.trim()) : ''}${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+            `<br/><br/>Tap a model to switch this session, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
           session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
         } else {
-          await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
+          await sendReply(`${currentLine}${defaultLine}${extra}\n\nType /model <name> to switch this session. Options: ${VALID_ALIAS_HINT}.`);
         }
       } else {
-        await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
+        await sendReply(`${currentLine}${defaultLine}${extra}\n\nSwitching the live session needs interactive mode. Set the new-session default with /model default <name>.`);
       }
       break;
     }
