@@ -1080,6 +1080,13 @@ describe('preambleMatchesText', () => {
     expect(preambleMatchesText('', 'anything here at all')).toBe(false);
     expect(preambleMatchesText('two words', 'two words')).toBe(false);
   });
+  it('does not match a short preamble merely contained in a much longer message', () => {
+    const shortPreamble = 'fixing the editor navigator pipeline bug today now';
+    const longUnrelated = 'fixing the editor navigator pipeline bug today now ' +
+      'but also rewriting the entire authentication subsystem and migrating the database ' +
+      'plus refactoring the deployment scripts and updating every dependency across services';
+    expect(preambleMatchesText(shortPreamble, longUnrelated)).toBe(false);
+  });
 });
 
 describe('isIdleReadyScreen', () => {

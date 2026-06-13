@@ -802,7 +802,14 @@ async function handleInteractivePrompt(session, prompt) {
   // is complete: then we also remember it to suppress the duplicate that flushes
   // from the transcript post-answer (the user's "suppress only if full" choice).
   // A partial/empty capture is skipped here and left to the transcript.
-  if (session.iv && typeof session.iv.recentOutput === 'function' && session.pendingInteractivePrompt === prompt) {
+  // Scope this to AskUserQuestion-style menus (option descriptions or a
+  // free-text slot). Other prompts (permission confirms, simple pickers) carry
+  // their own context in the question text and have no fresh prose above them —
+  // attempting a preamble there risks surfacing a stale paragraph from an
+  // earlier turn whose `●` marker sits above the menu.
+  const auqLike = prompt.freeTextIdx != null ||
+    (Array.isArray(prompt.options) && prompt.options.some(o => o && o.description));
+  if (auqLike && session.iv && typeof session.iv.recentOutput === 'function' && session.pendingInteractivePrompt === prompt) {
     try {
       const { preamble, complete } = extractPreamble(session.iv.recentOutput(), prompt);
       if (complete && preamble) {
@@ -1555,10 +1562,17 @@ function handleClaudeEvent(session, event) {
           // preamble (before an AskUserQuestion), drop the post-answer
           // duplicate instead of flushing it again. Only fires for a complete
           // pre-answer capture (see handleInteractivePrompt).
-          if (session._suppressPreambleText && preambleMatchesText(session._suppressPreambleText, session.responseBuffer)) {
-            debug('Suppressing post-answer duplicate of surfaced preamble');
+          const matchesPreamble = session._suppressPreambleText &&
+            preambleMatchesText(session._suppressPreambleText, session.responseBuffer);
+          // Either way, retire the suppression flag after this first post-set
+          // assistant flush — it's either the duplicate (drop it) or proof the
+          // duplicate isn't coming (don't leave it armed into later turns).
+          if (session._suppressPreambleText) {
             session._suppressPreambleText = null;
             if (session.suppressPreambleTimer) { clearTimeout(session.suppressPreambleTimer); session.suppressPreambleTimer = null; }
+          }
+          if (matchesPreamble) {
+            debug('Suppressing post-answer duplicate of surfaced preamble');
             session.responseBuffer = '';
           } else {
             flushResponse(session);
