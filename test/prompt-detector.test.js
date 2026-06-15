@@ -1031,6 +1031,22 @@ describe('queued-message widget (type-ahead) is not a prompt', () => {
     expect(classifyScreen(twoQueued)).toBeNull();
   });
 
+  it('handles a queued widget whose footer renders as its own background-filled line', () => {
+    // Regression for the stripInputBox/stripQueuedWidget ordering hazard: when
+    // the widget footer arrives as a standalone background-filled row,
+    // stripInputBox (which drops bg-filled non-menu lines) must not delete it
+    // before stripQueuedWidget can anchor on it — otherwise the numbered queued
+    // line (kept by the numbered exception) trips the phantom menu again.
+    const bg = '\x1b[48;5;237m', fg = '\x1b[38;5;231m', rst = '\x1b[0m';
+    const raw = [
+      `${bg}${fg}❯ 1. also to be clear the designs are not linked to a book${rst}`,
+      `${bg}${fg}❯ Press up to edit queued messages${rst}`,
+    ].join('\n');
+    // Mirror the live _check pipeline: stripInputBox -> stripAnsi -> stripQueuedWidget.
+    const screen = stripQueuedWidget(stripAnsi(stripInputBox(raw)));
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(false);
+  });
+
   it('stripQueuedWidget blanks the footer and marker lines, tolerating spacer blanks', () => {
     const screen = [
       'keep this prose line',
