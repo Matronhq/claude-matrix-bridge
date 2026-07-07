@@ -3135,20 +3135,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
-      sessions.delete(roomId);
-      killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
-      restarted.sendCallback = sendReply;
-      restarted.sendHtml = sendHtml;
-      restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
-      restarted.originRoomId = existing.originRoomId;
-      restarted.firstMessageCaptured = existing.firstMessageCaptured;
-      // Persist immediately so auto-resume works if the bridge restarts
-      if (restartSessionId) {
-        persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
-      }
+      recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
@@ -4894,6 +4882,42 @@ const apiServer = createServer(async (req, res) => {
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
+
+// Tear down a room's live session and re-spawn it resuming the SAME claude
+// session id, applying `overrides` ({ model, interactive, mcpExtras }) to the
+// new createSession options. Carries user-visible state (queue, per-room
+// toggles, chat history) across the swap. Returns the new session, or null if
+// the room has no live session. Shared by /restart, /model (print) and /mode.
+function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
+  const existing = sessions.get(roomId);
+  if (!existing) return null;
+  const sessionId = existing.claudeSessionId;
+  const workdir = existing.workdir;
+  const originRoomId = existing.originRoomId;
+  sessions.delete(roomId);
+  killSession(existing);
+  const next = createSession(roomId, workdir, sessionId, {
+    mcpExtras: existing.mcpExtras,
+    ...overrides,
+  });
+  next.sendCallback = sendReply;
+  next.sendHtml = sendHtml;
+  next.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  next.originRoomId = originRoomId;
+  next.firstMessageCaptured = existing.firstMessageCaptured;
+  next.queuedMessages = existing.queuedMessages;
+  next.queueNotifications = existing.queueNotifications;
+  next.showWorking = existing.showWorking;
+  next.showBashOutput = existing.showBashOutput;
+  next.chatHistory = existing.chatHistory;
+  next.pinnedSummaryText = existing.pinnedSummaryText;
+  next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  if (sessionId) {
+    persistSession(roomId, sessionId, workdir, originRoomId);
+  }
+  return next;
+}
 
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
