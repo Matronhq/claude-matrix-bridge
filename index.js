@@ -17,7 +17,15 @@ import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
-import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
+import {
+  resolveInteractive,
+  resolveModel,
+  normalizeModeArg,
+  modeLabel,
+  modeButtons,
+  planModeSwitch,
+} from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -278,7 +286,13 @@ function getPersistedSession(roomId) {
 const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
-  if (INTERACTIVE_MODE) {
+  const persistedMode = getPersistedSession(roomId);
+  const interactive = resolveInteractive({
+    option: options.interactive,
+    persisted: persistedMode?.interactiveMode,
+    fallback: INTERACTIVE_MODE,
+  });
+  if (interactive) {
     return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -324,6 +338,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       },
     }),
   ];
+  const printModel = resolveModel({ option: options.model, persisted: persistedMode?.model });
+  if (printModel) {
+    args.push('--model', printModel);
+  }
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
   }
@@ -510,6 +528,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const sessionId = resumeSessionId || randomUUID();
+  const model = resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
   const settings = {
     hooks: {
@@ -550,6 +569,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify(settings),
   );
+  if (model) {
+    claudeArgs.push('--model', model);
+  }
 
   const nodeBinDir = path.dirname(process.execPath);
   const existingPath = process.env.PATH || '';
@@ -3120,20 +3142,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
-      sessions.delete(roomId);
-      killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
-      restarted.sendCallback = sendReply;
-      restarted.sendHtml = sendHtml;
-      restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
-      restarted.originRoomId = existing.originRoomId;
-      restarted.firstMessageCaptured = existing.firstMessageCaptured;
-      // Persist immediately so auto-resume works if the bridge restarts
-      if (restartSessionId) {
-        persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
-      }
+      recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
@@ -3477,6 +3487,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
         `/effort [level] — Show or set effort level\n` +
+        `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/tools — List available tools\n` +
@@ -3512,6 +3523,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
           ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
+          ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/tools', 'List available tools'],
@@ -3588,7 +3600,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        switchModelInSession(session, arg, sendReply);
+        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -3610,9 +3622,47 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         } else {
           await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
+      } else if (session.sendButtonMessage) {
+        const buttons = modelButtons();
+        const plain = `${currentLine}${extra}\n\nTap a model to switch (restarts to apply), or type /model <name>.`;
+        const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+        const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+          `<br/><br/>Tap a model to switch (restarts to apply), or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+        session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
       } else {
-        await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
+        await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
+      break;
+    }
+
+    case '!mode': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      const currentInteractive = !!session.iv;
+      const arg = parts[1];
+      if (!arg) {
+        const line = `Mode: ${modeLabel(currentInteractive)}`;
+        if (session.sendButtonMessage) {
+          const buttons = modeButtons(currentInteractive);
+          const plain = `${line}\n\nTap to switch, or type /mode interactive | /mode print.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🔀 ${escapeHtml(line)}</b><br/><br/>Tap to switch, or type <code>/mode interactive</code> | <code>/mode print</code>.<br/>${htmlButtons}`;
+          session.sendButtonMessage(line, buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`${line}\n\nType /mode interactive or /mode print to switch.`);
+        }
+        break;
+      }
+      const target = normalizeModeArg(arg);
+      if (!target) {
+        await sendReply('Usage: /mode interactive | /mode print');
+        break;
+      }
+      const wantInteractive = target === 'interactive';
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
       break;
     }
 
@@ -3801,7 +3851,7 @@ client.on('room.message', async (roomId, event) => {
     const bridgeCommandNames = new Set([
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
+      'mcp', 'model', 'mode', 'effort', 'cost', 'usage', 'tools',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3967,7 +4017,19 @@ client.on('room.message', async (roomId, event) => {
     // Model picker button (no-arg /model) — value is `model:<alias>`.
     const modelMatch = value.match(/^model:(.+)$/);
     if (modelMatch) {
-      switchModelInSession(session, modelMatch[1], sendReply);
+      applyModelSwitch(roomId, session, modelMatch[1], { sendReply, sendHtml: sendHtmlFn });
+      return;
+    }
+
+    // Mode toggle button — value is `mode:interactive` or `mode:print`.
+    const modeMatch = value.match(/^mode:(interactive|print)$/);
+    if (modeMatch) {
+      if (!session || !session.alive) {
+        sendReply('No active session. Start a session first.');
+        return;
+      }
+      const wantInteractive = modeMatch[1] === 'interactive';
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml: sendHtmlFn });
       return;
     }
 
@@ -4879,6 +4941,91 @@ const apiServer = createServer(async (req, res) => {
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
+
+// Apply a /model switch for either mode. Interactive sessions type /model into
+// the live TUI (immediate); print sessions restart the claude -p process with
+// --model <alias> --resume (history preserved). Used by the !model command and
+// the model: picker button.
+function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+  if (session.iv) {
+    // Interactive: type /model into the live TUI. Not persisted by design —
+    // the pick applies to the live session only (spec non-goal); a restart
+    // falls back to the persisted/default model.
+    switchModelInSession(session, arg, sendReply);
+    return;
+  }
+  const decision = planPrintModelSwitch(session, arg);
+  if (!decision.ok) {
+    sendReply(decision.message);
+    return;
+  }
+  sendReply(decision.message);
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: decision.normalized });
+  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
+  if (next) next.currentModel = decision.normalized;
+}
+
+// Apply a /mode switch (interactive <-> print) for a room: gate via
+// planModeSwitch, then persist the choice and restart the session in the new
+// mode (same session id, history preserved). Used by the !mode command and the
+// mode: toggle button.
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+  const decision = planModeSwitch(session, wantInteractive);
+  if (!decision.ok) {
+    sendReply(decision.message);
+    return;
+  }
+  sendReply(decision.message);
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
+  recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
+}
+
+// Tear down a room's live session and re-spawn it resuming the SAME claude
+// session id, applying `overrides` ({ model, interactive, mcpExtras }) to the
+// new createSession options. Carries user-visible state (queue, per-room
+// toggles, chat history) across the swap. Returns the new session, or null if
+// the room has no live session. Shared by /restart, /model (print) and /mode.
+function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
+  const existing = sessions.get(roomId);
+  if (!existing) return null;
+  const sessionId = existing.claudeSessionId;
+  const workdir = existing.workdir;
+  const originRoomId = existing.originRoomId;
+  sessions.delete(roomId);
+  killSession(existing);
+  const next = createSession(roomId, workdir, sessionId, {
+    mcpExtras: existing.mcpExtras,
+    // Preserve the currently-active model across the swap. An in-TUI /model
+    // pick updates currentModel but isn't persisted (by design), so without
+    // this a /mode toggle or /restart would resume on the stale persisted/
+    // default model. An explicit override (e.g. /model in print mode) still
+    // wins via the spread below.
+    model: existing.currentModel || undefined,
+    ...overrides,
+  });
+  next.sendCallback = sendReply;
+  next.sendHtml = sendHtml;
+  next.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  next.originRoomId = originRoomId;
+  next.firstMessageCaptured = existing.firstMessageCaptured;
+  next.queuedMessages = existing.queuedMessages;
+  next.queueNotifications = existing.queueNotifications;
+  next.showWorking = existing.showWorking;
+  next.showBashOutput = existing.showBashOutput;
+  next.chatHistory = existing.chatHistory;
+  next.pinnedSummaryText = existing.pinnedSummaryText;
+  next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  if (sessionId) {
+    persistSession(roomId, sessionId, workdir, originRoomId);
+  }
+  // A resumed interactive TUI isn't ready for input for a few seconds; hold
+  // the first post-switch message until it is, so it isn't typed into a
+  // still-loading TUI and dropped. No-op for print sessions (enterResumeHold
+  // returns early when there's no PTY).
+  enterResumeHold(next);
+  return next;
+}
 
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
