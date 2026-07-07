@@ -18,7 +18,14 @@ import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } 
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
-import { resolveInteractive, resolveModel } from './lib/session-mode.js';
+import {
+  resolveInteractive,
+  resolveModel,
+  normalizeModeArg,
+  modeLabel,
+  modeButtons,
+  planModeSwitch,
+} from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -3480,6 +3487,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
         `/effort [level] — Show or set effort level\n` +
+        `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/tools — List available tools\n` +
@@ -3515,6 +3523,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
           ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
+          ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/tools', 'List available tools'],
@@ -3623,6 +3632,44 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       } else {
         await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
+      break;
+    }
+
+    case '!mode': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      const currentInteractive = !!session.iv;
+      const arg = parts[1];
+      if (!arg) {
+        const line = `Mode: ${modeLabel(currentInteractive)}`;
+        if (session.sendButtonMessage) {
+          const buttons = modeButtons(currentInteractive);
+          const plain = `${line}\n\nTap to switch, or type /mode interactive | /mode print.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🔀 ${escapeHtml(line)}</b><br/><br/>Tap to switch, or type <code>/mode interactive</code> | <code>/mode print</code>.<br/>${htmlButtons}`;
+          session.sendButtonMessage(line, buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`${line}\n\nType /mode interactive or /mode print to switch.`);
+        }
+        break;
+      }
+      const target = normalizeModeArg(arg);
+      if (!target) {
+        await sendReply('Usage: /mode interactive | /mode print');
+        break;
+      }
+      const wantInteractive = target === 'interactive';
+      const decision = planModeSwitch(session, wantInteractive);
+      if (!decision.ok) {
+        await sendReply(decision.message);
+        break;
+      }
+      await sendReply(decision.message);
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
+      recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
       break;
     }
 
@@ -3811,7 +3858,7 @@ client.on('room.message', async (roomId, event) => {
     const bridgeCommandNames = new Set([
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
+      'mcp', 'model', 'mode', 'effort', 'cost', 'usage', 'tools',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3978,6 +4025,25 @@ client.on('room.message', async (roomId, event) => {
     const modelMatch = value.match(/^model:(.+)$/);
     if (modelMatch) {
       applyModelSwitch(roomId, session, modelMatch[1], { sendReply, sendHtml: sendHtmlFn });
+      return;
+    }
+
+    // Mode toggle button — value is `mode:interactive` or `mode:print`.
+    const modeMatch = value.match(/^mode:(interactive|print)$/);
+    if (modeMatch) {
+      if (!session || !session.alive) {
+        sendReply('No active session. Start a session first.');
+        return;
+      }
+      const wantInteractive = modeMatch[1] === 'interactive';
+      const decision = planModeSwitch(session, wantInteractive);
+      if (!decision.ok) {
+        sendReply(decision.message);
+        return;
+      }
+      sendReply(decision.message);
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
+      recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml: sendHtmlFn });
       return;
     }
 
