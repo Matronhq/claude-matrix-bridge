@@ -17,7 +17,7 @@ import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
-import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { resolveInteractive, resolveModel } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
@@ -3591,7 +3591,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        switchModelInSession(session, arg, sendReply);
+        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -3613,8 +3613,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         } else {
           await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
+      } else if (session.sendButtonMessage) {
+        const buttons = modelButtons();
+        const plain = `${currentLine}${extra}\n\nTap a model to switch (restarts to apply), or type /model <name>.`;
+        const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+        const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+          `<br/><br/>Tap a model to switch (restarts to apply), or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+        session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
       } else {
-        await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
+        await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
       break;
     }
@@ -3970,7 +3977,7 @@ client.on('room.message', async (roomId, event) => {
     // Model picker button (no-arg /model) — value is `model:<alias>`.
     const modelMatch = value.match(/^model:(.+)$/);
     if (modelMatch) {
-      switchModelInSession(session, modelMatch[1], sendReply);
+      applyModelSwitch(roomId, session, modelMatch[1], { sendReply, sendHtml: sendHtmlFn });
       return;
     }
 
@@ -4882,6 +4889,26 @@ const apiServer = createServer(async (req, res) => {
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
+
+// Apply a /model switch for either mode. Interactive sessions type /model into
+// the live TUI (immediate); print sessions restart the claude -p process with
+// --model <alias> --resume (history preserved). Used by the !model command and
+// the model: picker button.
+function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+  if (session.iv) {
+    switchModelInSession(session, arg, sendReply);
+    return;
+  }
+  const decision = planPrintModelSwitch(session, arg);
+  if (!decision.ok) {
+    sendReply(decision.message);
+    return;
+  }
+  sendReply(decision.message);
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: decision.normalized });
+  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
+  if (next) next.currentModel = decision.normalized;
+}
 
 // Tear down a room's live session and re-spawn it resuming the SAME claude
 // session id, applying `overrides` ({ model, interactive, mcpExtras }) to the
