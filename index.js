@@ -4995,6 +4995,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   killSession(existing);
   const next = createSession(roomId, workdir, sessionId, {
     mcpExtras: existing.mcpExtras,
+    // Preserve the currently-active model across the swap. An in-TUI /model
+    // pick updates currentModel but isn't persisted (by design), so without
+    // this a /mode toggle or /restart would resume on the stale persisted/
+    // default model. An explicit override (e.g. /model in print mode) still
+    // wins via the spread below.
+    model: existing.currentModel || undefined,
     ...overrides,
   });
   next.sendCallback = sendReply;

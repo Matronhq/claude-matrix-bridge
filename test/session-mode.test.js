@@ -84,6 +84,11 @@ describe('planModeSwitch', () => {
     expect(d.ok).toBe(false);
     expect(d.message).toMatch(/question/i);
   });
+  it('refuses while the session is still in the post-resume input hold', () => {
+    const d = planModeSwitch({ iv: { alive: true }, busy: false, _awaitingInputReady: true }, false);
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/resuming/i);
+  });
   it('approves a clean switch', () => {
     const d = planModeSwitch({ iv: null, busy: false }, true);
     expect(d.ok).toBe(true);
