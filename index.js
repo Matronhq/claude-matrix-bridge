@@ -3662,14 +3662,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const wantInteractive = target === 'interactive';
-      const decision = planModeSwitch(session, wantInteractive);
-      if (!decision.ok) {
-        await sendReply(decision.message);
-        break;
-      }
-      await sendReply(decision.message);
-      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
-      recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
       break;
     }
 
@@ -4036,14 +4029,7 @@ client.on('room.message', async (roomId, event) => {
         return;
       }
       const wantInteractive = modeMatch[1] === 'interactive';
-      const decision = planModeSwitch(session, wantInteractive);
-      if (!decision.ok) {
-        sendReply(decision.message);
-        return;
-      }
-      sendReply(decision.message);
-      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
-      recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml: sendHtmlFn });
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml: sendHtmlFn });
       return;
     }
 
@@ -4962,6 +4948,9 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
 // the model: picker button.
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
   if (session.iv) {
+    // Interactive: type /model into the live TUI. Not persisted by design —
+    // the pick applies to the live session only (spec non-goal); a restart
+    // falls back to the persisted/default model.
     switchModelInSession(session, arg, sendReply);
     return;
   }
@@ -4974,6 +4963,21 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: decision.normalized });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
   if (next) next.currentModel = decision.normalized;
+}
+
+// Apply a /mode switch (interactive <-> print) for a room: gate via
+// planModeSwitch, then persist the choice and restart the session in the new
+// mode (same session id, history preserved). Used by the !mode command and the
+// mode: toggle button.
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+  const decision = planModeSwitch(session, wantInteractive);
+  if (!decision.ok) {
+    sendReply(decision.message);
+    return;
+  }
+  sendReply(decision.message);
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
+  recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
 }
 
 // Tear down a room's live session and re-spawn it resuming the SAME claude
@@ -5009,6 +5013,11 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   if (sessionId) {
     persistSession(roomId, sessionId, workdir, originRoomId);
   }
+  // A resumed interactive TUI isn't ready for input for a few seconds; hold
+  // the first post-switch message until it is, so it isn't typed into a
+  // still-loading TUI and dropped. No-op for print sessions (enterResumeHold
+  // returns early when there's no PTY).
+  enterResumeHold(next);
   return next;
 }
 
