@@ -2,7 +2,7 @@ import { describe, it, test, expect } from 'vitest';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -997,6 +997,93 @@ describe('looksLikeUnclassifiedMenu', () => {
     expect(looksLikeUnclassifiedMenu('All done. Nothing to pick here.')).toBe(false);
     expect(looksLikeUnclassifiedMenu('')).toBe(false);
     expect(looksLikeUnclassifiedMenu(null)).toBe(false);
+  });
+});
+
+describe('queued-message widget (type-ahead) is not a prompt', () => {
+  // Claude Code renders messages typed while it is busy ("type-ahead") in a
+  // queued-message widget: one or more `❯ <text>` lines closed by a
+  // `❯ Press up to edit queued messages` footer. A queued message that happens
+  // to begin with "1." (here the user's reply "1. also to be clear …") is
+  // structurally identical to a numbered menu item, so the detector surfaced a
+  // phantom prompt while claude was mid-turn. The widget lines must be ignored.
+  const queuedScreen = [
+    '  ❯ 1. also to be clear the designs are not linked to a book',
+    '',
+    '❯ Press up to edit queued messages',
+    '────────────────────────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to hide tasks            ◉ xhigh · /effort',
+  ].join('\n');
+
+  it('looksLikeUnclassifiedMenu ignores a queued type-ahead message', () => {
+    expect(looksLikeUnclassifiedMenu(queuedScreen)).toBe(false);
+  });
+
+  it('classifyScreen does not surface multiple queued messages as a menu', () => {
+    // Two queued messages that read like a 1./2. menu would otherwise pass the
+    // numbered-run guard (selection marker present).
+    const twoQueued = [
+      '  ❯ 1. first thing the user typed ahead while claude was busy',
+      '  ❯ 2. second thing the user typed ahead while claude was busy',
+      '❯ Press up to edit queued messages',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n');
+    expect(classifyScreen(twoQueued)).toBeNull();
+  });
+
+  it('handles a queued widget whose footer renders as its own background-filled line', () => {
+    // Regression for the stripInputBox/stripQueuedWidget ordering hazard: when
+    // the widget footer arrives as a standalone background-filled row,
+    // stripInputBox (which drops bg-filled non-menu lines) must not delete it
+    // before stripQueuedWidget can anchor on it — otherwise the numbered queued
+    // line (kept by the numbered exception) trips the phantom menu again.
+    const bg = '\x1b[48;5;237m', fg = '\x1b[38;5;231m', rst = '\x1b[0m';
+    const raw = [
+      `${bg}${fg}❯ 1. also to be clear the designs are not linked to a book${rst}`,
+      `${bg}${fg}❯ Press up to edit queued messages${rst}`,
+    ].join('\n');
+    // Mirror the live _check pipeline: stripInputBox -> stripAnsi -> stripQueuedWidget.
+    const screen = stripQueuedWidget(stripAnsi(stripInputBox(raw)));
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(false);
+  });
+
+  it('stripQueuedWidget blanks the footer and marker lines, tolerating spacer blanks', () => {
+    const screen = [
+      'keep this prose line',
+      '  ❯ a queued message',
+      '',
+      '❯ Press up to edit queued messages',
+    ].join('\n');
+    expect(stripQueuedWidget(screen).split('\n')).toEqual([
+      'keep this prose line',
+      '',
+      '',
+      '',
+    ]);
+  });
+
+  it('stripQueuedWidget leaves screens without the widget untouched and is idempotent', () => {
+    const plain = 'Which approach?\n❯ 1. Yes\n  2. No';
+    expect(stripQueuedWidget(plain)).toBe(plain);
+    const widget = '  ❯ typed ahead\n❯ Press up to edit queued messages';
+    const once = stripQueuedWidget(widget);
+    expect(stripQueuedWidget(once)).toBe(once);
+  });
+
+  it('still classifies a real menu that coexists with the queued widget', () => {
+    // The widget sits above an actual AskUserQuestion menu; blanking the widget
+    // must not eat the real menu below it.
+    const both = [
+      '  ❯ should we also bump the timeout?',
+      '❯ Press up to edit queued messages',
+      'Which approach should we take?',
+      '❯ 1. Refactor the parser',
+      '  2. Patch the regex',
+    ].join('\n');
+    const r = classifyScreen(both);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual(['Refactor the parser', 'Patch the regex']);
   });
 });
 
