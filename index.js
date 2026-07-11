@@ -3364,7 +3364,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
-      await updateRoomName(sessionRoomId, roomName);
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -3386,6 +3385,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // Rename after the session exists (not before) so updateRoomName's
+      // roomId -> session lookup — used to journal-mirror the title — finds it.
+      await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the session ID, don't wait for Claude's event
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
