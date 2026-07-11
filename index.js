@@ -3435,6 +3435,15 @@ function fetchUsageLimitsText(cwd) {
     const proc = spawn('claude', ['-p', '/usage', '--output-format', 'text'], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Every other claude spawn in this file clears CLAUDECODE (Bugbot
+      // finding #6) — without it, a `claude` child inherits CLAUDECODE from
+      // this process's own environment and can behave as though it's
+      // nested inside another Claude Code session. This is a global,
+      // session-less one-shot (no roomId/workdir session to speak of), so
+      // it doesn't replicate the rest of the session spawns' env shape
+      // (BRIDGE_ROOM_ID, MATRIX_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
+      // all meaningless here); it just needs the same CLAUDECODE treatment.
+      env: { ...process.env, CLAUDECODE: '' },
     });
     let stdout = '';
     let stderr = '';
