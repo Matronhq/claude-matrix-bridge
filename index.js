@@ -31,6 +31,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { createJournalPublisher } from './lib/journal-publisher.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -162,6 +163,31 @@ if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
 }
 
+// Journal dual-post (migration off Matrix — see matron-journal's protocol
+// design doc). JOURNAL_TOKEN_FILE takes precedence over JOURNAL_TOKEN when
+// both are set; the file is read once at boot. Disabled (safe no-op) unless
+// both the URL and a token resolve to non-empty strings — see
+// createJournalPublisher's own warning for the disabled case.
+const JOURNAL_WS_URL = process.env.JOURNAL_WS_URL || '';
+function resolveJournalToken() {
+  const file = process.env.JOURNAL_TOKEN_FILE || '';
+  if (file) {
+    try {
+      return fs.readFileSync(file, 'utf-8').trim();
+    } catch (e) {
+      console.warn(`[journal] Could not read JOURNAL_TOKEN_FILE ${file}: ${e.message}`);
+      return '';
+    }
+  }
+  return (process.env.JOURNAL_TOKEN || '').trim();
+}
+const _journalToken = resolveJournalToken();
+const journalPublisher = createJournalPublisher({ url: JOURNAL_WS_URL, token: _journalToken, log: console });
+// Used to skip the per-session buffering/bookkeeping entirely when the
+// publisher is a disabled no-op (its methods are already safe no-ops; this
+// just avoids pointless buffers and spurious overflow warnings).
+const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
+
 function expandHome(p) {
   if (p === '~') return os.homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
@@ -284,6 +310,95 @@ function getPersistedSession(roomId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+
+// --- Journal dual-post mirroring ---
+//
+// The journal's convo_id is the Claude session UUID (session.claudeSessionId).
+// It's known immediately in interactive mode (assigned at spawn) but only
+// after the first transcript event lands in print mode. Until it's known,
+// journal traffic for that session is buffered (bounded) and flushed —
+// convo_upsert first, then the buffered frames in order — the moment the id
+// shows up (see the session_id capture in handleClaudeEvent). Rooms that
+// never get a session (control-room chatter) are never mirrored, matching v1
+// scope.
+const JOURNAL_BUFFER_LIMIT = 100;
+
+function journalBufferPush(session, method, payload) {
+  if (!session._journalBuffer) session._journalBuffer = [];
+  if (session._journalBuffer.length >= JOURNAL_BUFFER_LIMIT) {
+    session._journalBuffer.shift();
+    if (!session._journalBufferOverflowWarned) {
+      session._journalBufferOverflowWarned = true;
+      console.warn(`[journal] pre-session-id buffer overflow for room ${session.roomId} — dropping oldest`);
+    }
+  }
+  session._journalBuffer.push({ method, payload });
+}
+
+// Send now if the convo_id is known, otherwise buffer for the eventual flush.
+function journalPublish(session, method, payload) {
+  if (!JOURNAL_ENABLED) return;
+  if (session.claudeSessionId) {
+    // Protocol requirement: a convo_upsert must reach the server before (or
+    // with) the first publish to a convo — the server hard-rejects publishes
+    // to conversations that don't exist yet. Print-mode sessions get this via
+    // journalFlushForSession, but iv-mode sessions know their id at spawn and
+    // never buffer, so an assistant notice posted before the first
+    // state-transition upsert would otherwise be dropped server-side.
+    if (!session._journalConvoEstablished) {
+      session._journalConvoEstablished = true;
+      if (method !== 'upsertConvo') {
+        journalPublisher.upsertConvo(session.claudeSessionId, { title: session._journalTitleHint });
+      }
+    }
+    journalPublisher[method](session.claudeSessionId, payload);
+  } else {
+    journalBufferPush(session, method, payload);
+  }
+}
+
+function journalUpsertConvo(session, opts) {
+  if (opts.title !== undefined) session._journalTitleHint = opts.title;
+  journalPublish(session, 'upsertConvo', opts);
+}
+
+// Mirror a session_state transition, but only on actual change — busy/prompt/
+// turn-end events fire far more often than the state actually flips.
+function journalSessionState(session, state) {
+  if (session._journalState === state) return;
+  session._journalState = state;
+  journalUpsertConvo(session, { sessionState: state });
+}
+
+// Mirror a user's accepted prompt answer (button tap, numbered/lettered
+// quick-reply, yes-no confirm, free-text prompt reply, AskUserQuestion
+// answer) into the journal as their side of the conversation. These paths
+// answer via PTY keystrokes (iv.respondToPrompt / iv.sendText) or the
+// tool_result stdin write and so bypass sendToSession's user-text mirror —
+// without this the journal would record the prompt but never the choice.
+// Each answering path calls this exactly once, at the point the answer is
+// accepted and dispatched.
+function journalMirrorUserAnswer(session, text) {
+  const body = typeof text === 'string' ? text.trim() : '';
+  if (!body) return;
+  journalPublish(session, 'publishText', { body, from: 'user' });
+}
+
+// Called once claudeSessionId becomes known: establishes the conversation
+// (with whatever title we've learned so far, if any) and replays anything
+// buffered while we didn't yet know the convo_id, in order.
+function journalFlushForSession(session) {
+  const convoId = session.claudeSessionId;
+  if (!convoId) return;
+  session._journalConvoEstablished = true;
+  journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
+  const buffered = session._journalBuffer;
+  session._journalBuffer = null;
+  if (!buffered) return;
+  for (const { method, payload } of buffered) {
+    journalPublisher[method](convoId, payload);
+  }
+}
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const persistedMode = getPersistedSession(roomId);
@@ -457,6 +572,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
+        journalSessionState(session, 'done');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Pass mcpExtras explicitly: createSession can fall back to persisted
         // state, but a print-mode session that crashes before its session_id
@@ -475,6 +591,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        // Carry journal-mirror state too: traffic buffered before the first
+        // session_id arrived would otherwise be silently dropped, keeping
+        // _journalState preserves the change-dedup across the restart, and
+        // the restarted session resumes the same convo (same claudeSessionId)
+        // so its established flag carries as well.
+        restarted._journalBuffer = session._journalBuffer;
+        restarted._journalTitleHint = session._journalTitleHint;
+        restarted._journalState = session._journalState;
+        restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -488,6 +613,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         }
       } else {
         sessions.delete(roomId);
+        journalSessionState(session, 'done');
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -660,6 +786,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // first-run modals, /login, unauthenticated "please run /login"
     // pseudo-turns) — without this the bridge's `busy` flag gets stuck
     // and every subsequent user message hits the queue path.
+    // Journal mirror is unconditional (journalSessionState dedupes on actual
+    // change): a prompt can arrive while busy is already false, and the
+    // journal must still show 'waiting'. Only the busy/typing cleanup below
+    // stays gated.
+    journalSessionState(session, 'waiting');
     if (session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
@@ -688,6 +819,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
+        journalSessionState(session, 'done');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
@@ -705,6 +837,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        // Carry journal-mirror state (see the matching print-mode block).
+        restarted._journalBuffer = session._journalBuffer;
+        restarted._journalTitleHint = session._journalTitleHint;
+        restarted._journalState = session._journalState;
+        restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -716,6 +853,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         }
       } else {
         sessions.delete(roomId);
+        journalSessionState(session, 'done');
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -746,6 +884,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    journalSessionState(session, 'waiting');
     // The turn ended, so any best-effort unclassified-prompt notice is stale.
     session.pendingUnclassifiedPrompt = false;
     // A real turn-end supersedes any armed operator-compact fallback: disarm
@@ -959,6 +1098,9 @@ function maybeResolveInteractivePrompt(session, userText) {
       : { kind: p.kind, key: opt.key };
     session.pendingInteractivePrompt = null;
     session.iv.respondToPrompt(ftResponse);
+    // The reply goes in via iv.sendText below (not sendToSession), so mirror
+    // the user's answer here — this covers both routeFreeText call sites.
+    journalMirrorUserAnswer(session, replyText);
     setTimeout(() => {
       if (session.iv && session.iv.alive) session.iv.sendText(replyText);
     }, 250);
@@ -973,6 +1115,7 @@ function maybeResolveInteractivePrompt(session, userText) {
     session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving yes-no prompt reply="${userText}" → key=${response.key}`);
     session.iv.respondToPrompt(response);
+    journalMirrorUserAnswer(session, label);
     ack(label);
     return true;
   }
@@ -1014,6 +1157,7 @@ function maybeResolveInteractivePrompt(session, userText) {
       session.pendingInteractivePrompt = null;
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
       session.iv.respondToPrompt(response);
+      journalMirrorUserAnswer(session, `${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
       return true;
     }
@@ -1024,6 +1168,7 @@ function maybeResolveInteractivePrompt(session, userText) {
     session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
     session.iv.respondToPrompt(response);
+    journalMirrorUserAnswer(session, `${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
     return true;
   }
@@ -1143,6 +1288,8 @@ function handleInteractiveScreenUpdate(session, update) {
   // code, "paste code here" content, etc.) gets typed straight into the
   // PTY instead of dropping into the queue. Mirrors the iv-prompt
   // handler at iv.on('prompt') in createInteractiveSessionForRoom.
+  // Unconditional (dedupes internally) — see the matching iv-prompt handler.
+  journalSessionState(session, 'waiting');
   if (session.busy) {
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
@@ -1199,6 +1346,8 @@ function handleUnclassifiedPrompt(session, { screen }) {
   if (session.sendHtml) session.sendHtml(plain, html);
   else session.sendCallback(plain);
   session.pendingUnclassifiedPrompt = true;
+  // Unconditional (dedupes internally) — see the matching iv-prompt handler.
+  journalSessionState(session, 'waiting');
   // Like a structured prompt, this means claude is awaiting the user — clear
   // busy so the reply is typed into the PTY instead of dropping into the queue.
   if (session.busy) {
@@ -1370,6 +1519,10 @@ function submitAnswer(session, answerText) {
       return;
     }
     session.busy = true;
+    journalSessionState(session, 'running');
+    // This answer goes in via a raw tool_result stdin write (not
+    // sendToSession), so mirror the user's side of it here.
+    journalMirrorUserAnswer(session, answerText);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -1538,6 +1691,7 @@ function handleClaudeEvent(session, event) {
     session.claudeSessionId = event.session_id;
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
+    journalFlushForSession(session);
   }
 
   // Lazy-construct subagent watcher once we know the session id. Print-mode
@@ -1903,6 +2057,9 @@ function handleClaudeEvent(session, event) {
         session.responseBuffer = '';
       }
       session.busy = false;
+      // Print-mode's turn-end (this `case 'result':` block is its equivalent
+      // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
+      journalSessionState(session, 'waiting');
       stripQueueNotificationLinks(session);
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
@@ -2133,6 +2290,13 @@ function sendToSession(session, contentBlocks) {
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  journalSessionState(session, 'running');
+  // Mirror the user's side of the conversation into the journal. This is the
+  // single choke point every real inbound message flows through (directly for
+  // media, via sendTextToSession for plain text), so a message is mirrored
+  // exactly once here regardless of caller.
+  const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
+  if (journalText) journalPublish(session, 'publishText', { body: journalText, from: 'user' });
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
@@ -2622,6 +2786,11 @@ let botUserId;
 // --- Send to Matrix Room ---
 
 async function sendToRoom(roomId, text, html) {
+  // Journal mirror: every session reply and bridge notice that flows through
+  // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
+  // no active session (control-room chatter) are silently skipped.
+  const journalSession = sessions.get(roomId);
+  if (journalSession) journalPublish(journalSession, 'publishText', { body: text, from: 'assistant' });
   const content = {
     msgtype: 'm.text',
     body: text,
@@ -2640,6 +2809,7 @@ async function sendToRoom(roomId, text, html) {
 }
 
 async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
+  journalPublish(session, 'publishToolOutput', { tool_use_id, command, viewer_url, expires_at });
   // Sent as a regular m.room.message with a custom content key:
   // - matron-web-aware clients pick up `chat.matron.live_output` and render
   //   the live viewer tile.
@@ -2672,6 +2842,8 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
 
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
+  const journalSession = sessions.get(roomId);
+  if (journalSession) journalPublish(journalSession, 'publishPrompt', { question: prompt, options: buttons, mode });
   const content = {
     msgtype: 'm.text',
     body: fallbackBody,
@@ -2737,6 +2909,8 @@ async function createSessionRoom(inviteUserId) {
 }
 
 async function editMessage(roomId, eventId, plain, html) {
+  // Not mirrored to the journal in v1: the protocol has an `edit` event type
+  // (spec §7) but this module doesn't use it yet — deferred, see PR description.
   const content = {
     msgtype: 'm.text',
     body: `* ${plain}`,
@@ -2767,6 +2941,11 @@ async function stripQueueNotificationLinks(session) {
 }
 
 async function updateRoomName(roomId, name) {
+  // Single choke point for every title change (initial naming, media-file
+  // naming, and the LLM-driven rename in maybeUpdatePinnedSummary all call
+  // through here) — mirror it once, here, rather than at each call site.
+  const journalSession = sessions.get(roomId);
+  if (journalSession) journalUpsertConvo(journalSession, { title: name });
   try {
     await client.sendStateEvent(roomId, 'm.room.name', '', { name });
   } catch (e) {
@@ -3247,7 +3426,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
-      await updateRoomName(sessionRoomId, roomName);
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -3269,6 +3447,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // Rename after the session exists (not before) so updateRoomName's
+      // roomId -> session lookup — used to journal-mirror the title — finds it.
+      await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the session ID, don't wait for Claude's event
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
@@ -3949,11 +4130,13 @@ client.on('room.message', async (roomId, event) => {
       // Don't reset the detector dedup — the just-answered screen may linger a
       // moment, and resetting would let it re-emit unclassified-prompt.
       session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
+      journalMirrorUserAnswer(session, sel);
       return;
     }
     if (/^[a-zA-Z]$/.test(sel)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
+      journalMirrorUserAnswer(session, sel);
       return;
     }
     const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
@@ -4047,12 +4230,17 @@ client.on('room.message', async (roomId, event) => {
     const promptOptMatch = value.match(/^prompt-opt:(\d+)$/);
     if (promptOptMatch) {
       const p = session.pendingInteractivePrompt;
-      const resp = p ? promptResponseForButton(p, Number(promptOptMatch[1])) : null;
+      const optIdx = Number(promptOptMatch[1]);
+      const resp = p ? promptResponseForButton(p, optIdx) : null;
       if (p && resp && session.iv && session.iv.alive) {
         session.pendingInteractivePrompt = null;
         // Answering also retires any stale unclassified-prompt gate.
         session.pendingUnclassifiedPrompt = false;
         session.iv.respondToPrompt(resp);
+        // Mirror the human-readable choice (the tapped option's label; the
+        // raw prompt-opt:<n> value is a fallback that shouldn't happen —
+        // promptButtons refuses to build buttons for unlabeled options).
+        journalMirrorUserAnswer(session, (p.options?.[optIdx]?.label || '').trim() || value);
       }
       return;
     }
