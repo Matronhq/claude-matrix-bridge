@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { activityStateChanged, truncateActivityDetail } from '../lib/journal-activity.js';
+import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from '../lib/journal-activity.js';
 
 // Pure helpers only — no session, no publisher, no I/O. index.js owns the
 // session._journalActivityState field and calls these around it, exactly
@@ -58,5 +58,47 @@ describe('truncateActivityDetail', () => {
     expect(truncateActivityDetail(undefined)).toBeUndefined();
     expect(truncateActivityDetail(null)).toBeUndefined();
     expect(truncateActivityDetail(42)).toBeUndefined();
+  });
+});
+
+describe('shouldResumeThinkingAfterTool', () => {
+  it('resumes thinking when the last activity is tool and nothing is waiting on a prompt (the normal case)', () => {
+    expect(shouldResumeThinkingAfterTool('tool', false)).toBe(true);
+  });
+
+  it('the exact bug scenario: a prompt-answered iv turn (busy never set) still resumes thinking after its tool finishes', () => {
+    // session.busy is irrelevant to this helper by design — it isn't even a
+    // parameter. What matters is that activity state was 'tool' and nothing
+    // is currently waiting on a prompt, regardless of what busy is doing.
+    expect(shouldResumeThinkingAfterTool('tool', false)).toBe(true);
+  });
+
+  it('does not fire when the last activity state is not tool (nothing to resume from)', () => {
+    expect(shouldResumeThinkingAfterTool('thinking', false)).toBe(false);
+    expect(shouldResumeThinkingAfterTool('idle', false)).toBe(false);
+    expect(shouldResumeThinkingAfterTool(undefined, false)).toBe(false);
+    expect(shouldResumeThinkingAfterTool(null, false)).toBe(false);
+  });
+
+  it('never fires for a session waiting on a prompt, even if activity state still reads tool', () => {
+    expect(shouldResumeThinkingAfterTool('tool', true)).toBe(false);
+  });
+
+  it('a finished command never keeps showing while Claude continues working: tool -> (tool_result) -> thinking', () => {
+    // Simulates the exact sequence: dispatch marks 'tool', a Bash tool
+    // finishes (tool_result arrives), gate decides whether to resurrect.
+    let last = 'tool';
+    const waitingOnPrompt = false;
+    const resumed = shouldResumeThinkingAfterTool(last, waitingOnPrompt);
+    expect(resumed).toBe(true);
+    if (resumed) last = 'thinking';
+    expect(last).toBe('thinking');
+  });
+
+  it('thinking never fires for an idle/waiting session: turn already ended before a stray tool_result arrives', () => {
+    // 'result'/onTurnEnd already flipped activity to 'idle' (turn is over);
+    // a late tool_result for that turn's tool must not resurrect 'thinking'
+    // behind it.
+    expect(shouldResumeThinkingAfterTool('idle', false)).toBe(false);
   });
 });

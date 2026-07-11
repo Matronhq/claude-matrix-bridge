@@ -18,64 +18,91 @@ describe('markJournalOrigin / isJournalOrigin', () => {
   });
 });
 
+// New contract (post mixed-origin-garble fix, Bugbot finding #1): planQueueFlush
+// always produces a SINGLE merged send for the whole queue — the PTY's
+// sendText only tracks one pending Enter timer, so two back-to-back
+// sendToSession calls in iv mode cancel each other's Enter and submit one
+// concatenated, garbled message (see lib/interactive-session.js sendText).
+// Journal mirroring is now computed out-of-band as a separate `mirrorText`
+// string (the Matrix-origin text subset, in queue order) instead of driving
+// a second send — callers send `blocks` with skipJournalMirror true and
+// mirror `mirrorText` themselves via journalPublishUserItem.
 describe('planQueueFlush', () => {
-  it('returns [] for an empty queue', () => {
-    expect(planQueueFlush([])).toEqual([]);
-    expect(planQueueFlush(null)).toEqual([]);
+  it('returns an empty send for an empty/null/undefined queue', () => {
+    expect(planQueueFlush([])).toEqual({ blocks: [], mirrorText: '' });
+    expect(planQueueFlush(null)).toEqual({ blocks: [], mirrorText: '' });
+    expect(planQueueFlush(undefined)).toEqual({ blocks: [], mirrorText: '' });
   });
 
-  it('merges all-Matrix-origin text entries into one unmarked send (existing behavior)', () => {
-    const sends = planQueueFlush([text('one'), text('two'), text('three')]);
-    expect(sends.length).toBe(1);
-    expect(sends[0].journalOrigin).toBe(false);
-    expect(sends[0].blocks).toEqual([{ type: 'text', text: 'one\n\ntwo\n\nthree' }]);
+  it('all-Matrix queue: one merged send, mirrors everything (unchanged external behavior)', () => {
+    const { blocks, mirrorText } = planQueueFlush([text('one'), text('two'), text('three')]);
+    expect(blocks).toEqual([{ type: 'text', text: 'one\n\ntwo\n\nthree' }]);
+    expect(mirrorText).toBe('one\n\ntwo\n\nthree');
   });
 
-  it('merges all-journal-origin text entries into one send flagged journalOrigin', () => {
-    const sends = planQueueFlush([markJournalOrigin(text('a')), markJournalOrigin(text('b'))]);
-    expect(sends.length).toBe(1);
-    expect(sends[0].journalOrigin).toBe(true);
-    expect(sends[0].blocks).toEqual([{ type: 'text', text: 'a\n\nb' }]);
+  it('all-Matron (journal-origin) queue: one merged send, mirrors nothing', () => {
+    const { blocks, mirrorText } = planQueueFlush([
+      markJournalOrigin(text('a')),
+      markJournalOrigin(text('b')),
+    ]);
+    expect(blocks).toEqual([{ type: 'text', text: 'a\n\nb' }]);
+    expect(mirrorText).toBe('');
   });
 
-  it('mixed origin: splits into separate sends, preserving order, each with its own flag', () => {
-    const sends = planQueueFlush([
+  it('mixed origin: still ONE merged send (not split), mirror-text is only the Matrix-origin subset, in order', () => {
+    const { blocks, mirrorText } = planQueueFlush([
       text('matrix-1'),
       markJournalOrigin(text('matron-1')),
       markJournalOrigin(text('matron-2')),
       text('matrix-2'),
     ]);
-    expect(sends.map(s => s.journalOrigin)).toEqual([false, true, false]);
-    expect(sends[0].blocks).toEqual([{ type: 'text', text: 'matrix-1' }]);
-    expect(sends[1].blocks).toEqual([{ type: 'text', text: 'matron-1\n\nmatron-2' }]);
-    expect(sends[2].blocks).toEqual([{ type: 'text', text: 'matrix-2' }]);
+    // Single send: every entry's text merged in original queue order,
+    // regardless of origin — origin no longer partitions the send.
+    expect(blocks).toEqual([{ type: 'text', text: 'matrix-1\n\nmatron-1\n\nmatron-2\n\nmatrix-2' }]);
+    // Mirror payload: Matrix-origin entries only, in queue order.
+    expect(mirrorText).toBe('matrix-1\n\nmatrix-2');
   });
 
-  it('media entries flush accumulated text first, then ride in the same send (within one origin run)', () => {
-    const sends = planQueueFlush([text('caption'), media('pic.png'), text('after')]);
-    expect(sends.length).toBe(1);
-    expect(sends[0].journalOrigin).toBe(false);
-    expect(sends[0].blocks).toEqual([
+  it('media entries flush accumulated text first, then ride in the same (single) send', () => {
+    const { blocks, mirrorText } = planQueueFlush([text('caption'), media('pic.png'), text('after')]);
+    expect(blocks).toEqual([
       { type: 'text', text: 'caption' },
       { type: 'image', source: 'pic.png' },
       { type: 'text', text: 'after' },
     ]);
+    expect(mirrorText).toBe('caption\n\nafter');
   });
 
   it('multiple text blocks within one entry merge with \\n, entries with \\n\\n (existing behavior)', () => {
     const twoBlocks = [{ type: 'text', text: 'l1' }, { type: 'text', text: 'l2' }];
-    const sends = planQueueFlush([twoBlocks, text('next')]);
-    expect(sends.length).toBe(1);
-    expect(sends[0].blocks).toEqual([{ type: 'text', text: 'l1\nl2\n\nnext' }]);
+    const { blocks, mirrorText } = planQueueFlush([twoBlocks, text('next')]);
+    expect(blocks).toEqual([{ type: 'text', text: 'l1\nl2\n\nnext' }]);
+    expect(mirrorText).toBe('l1\nl2\n\nnext');
   });
 
-  it('an origin flip next to a media entry still keeps origins strictly separated', () => {
-    const sends = planQueueFlush([
+  it('an origin flip next to a media entry: still one send; mirror-text skips the journal-origin entry', () => {
+    const { blocks, mirrorText } = planQueueFlush([
       media('a.png'),
       markJournalOrigin(text('matron')),
     ]);
-    expect(sends.map(s => s.journalOrigin)).toEqual([false, true]);
-    expect(sends[0].blocks).toEqual([{ type: 'image', source: 'a.png' }]);
-    expect(sends[1].blocks).toEqual([{ type: 'text', text: 'matron' }]);
+    expect(blocks).toEqual([
+      { type: 'image', source: 'a.png' },
+      { type: 'text', text: 'matron' },
+    ]);
+    expect(mirrorText).toBe('');
+  });
+
+  it('a mixed-content entry (text + media in the SAME entry) mirrors its text portion when Matrix-origin', () => {
+    const entry = [{ type: 'text', text: 'File saved to /x' }, { type: 'image', source: 'x.png' }];
+    const { blocks, mirrorText } = planQueueFlush([entry]);
+    expect(blocks).toEqual(entry);
+    expect(mirrorText).toBe('File saved to /x');
+  });
+
+  it('a mixed-content entry does not mirror when journal-origin', () => {
+    const entry = markJournalOrigin([{ type: 'text', text: 'from matron' }, { type: 'image', source: 'x.png' }]);
+    const { blocks, mirrorText } = planQueueFlush([entry]);
+    expect(blocks).toEqual([{ type: 'text', text: 'from matron' }, { type: 'image', source: 'x.png' }]);
+    expect(mirrorText).toBe('');
   });
 });

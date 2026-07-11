@@ -35,7 +35,8 @@ import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
-import { activityStateChanged, truncateActivityDetail } from './lib/journal-activity.js';
+import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
+import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2344,11 +2345,23 @@ function handleClaudeEvent(session, event) {
               const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
               liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
               // The tracked tool that put us in 'tool' just completed and
-              // Claude continues — back to 'thinking', but only if the turn
-              // isn't already over (a tool_result can still arrive after
-              // 'result'/onTurnEnd already flipped busy false and activity
-              // idle; don't resurrect 'thinking' behind that).
-              if (session.busy) journalActivity(session, 'thinking');
+              // Claude continues — back to 'thinking'. Gated on activity
+              // state, NOT session.busy (Bugbot finding #2): iv-mode
+              // prompt-answer dispatch (respondToPrompt, raw PTY keystrokes)
+              // never sets busy=true, so a turn resumed by answering a
+              // prompt would fail a `session.busy` gate here and the
+              // indicator would stick on 'tool' — command already
+              // finished — until the whole turn ended. Deriving the gate
+              // from _journalActivityState instead means: only resurrect
+              // 'thinking' if 'tool' is still the latest activity sent (a
+              // tool_result arriving after 'result'/onTurnEnd already
+              // flipped activity to 'idle' must not resurrect 'thinking'
+              // behind that), and never while the session is actively
+              // surfacing a prompt to the user.
+              const waitingOnPrompt = !!session.pendingInteractivePrompt || !!session.waitingForAnswer;
+              if (shouldResumeThinkingAfterTool(session._journalActivityState, waitingOnPrompt)) {
+                journalActivity(session, 'thinking');
+              }
             }
           }
           if (block.type === 'tool_result' && block.is_error) {
@@ -2552,19 +2565,17 @@ function startResumeReadyWatcher(session) {
     const outbox = session._resumeOutbox || [];
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
-    if (session.alive && outbox.length > 0) {
-      // Merge everything the user sent during the hold — the gate is now
-      // disarmed, so this reaches the real send path. Grouped by origin
-      // (planQueueFlush): held messages of mixed origin (Matrix-typed +
-      // Matron-sent) flush as separate sends so only the Matrix-originated
-      // content is mirrored into the journal; Matron-originated content
-      // already has its own journal row and must not be duplicated.
-      for (const { blocks, journalOrigin } of planQueueFlush(outbox)) {
-        sendToSession(session, blocks, { skipJournalMirror: journalOrigin });
-      }
-    } else {
-      // Nothing to send (or session died) — don't leave a typing indicator
-      // spinning with no turn behind it.
+    // Merge everything the user sent during the hold into ONE send — the
+    // gate is now disarmed, so this reaches the real send path via the same
+    // merged-send + out-of-band-mirror path flushQueue uses (see
+    // dispatchMergedFlush / lib/queue-flush.js planQueueFlush): splitting a
+    // mixed-origin hold into separate sendToSession calls is what garbled
+    // iv-mode input in the first place (Bugbot finding #1).
+    const sent = session.alive && outbox.length > 0 && dispatchMergedFlush(session, outbox);
+    if (!sent) {
+      // Nothing actually went out (session died, hold was empty, or the
+      // send itself failed) — don't leave a typing indicator spinning with
+      // no turn behind it.
       session.busy = false;
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
@@ -2629,17 +2640,34 @@ function formatQueueSummary(queued) {
   return { plain, html: `<ol>${html}</ol>` };
 }
 
-// Merge/grouping rules live in lib/queue-flush.js (pure, unit-tested): one
-// send per contiguous same-origin run. For an all-Matrix queue that's the
-// original single merged send; a queue containing journal-originated
-// messages (Matron text routed in while busy) flushes those as separate
-// sends flagged skipJournalMirror, so already-journaled content is never
-// re-mirrored while Matrix-originated content still is.
+// Merge/grouping rules live in lib/queue-flush.js (pure, unit-tested):
+// ALWAYS one merged sendToSession call for the whole queue, regardless of
+// origin (Bugbot finding #1 — splitting a mixed-origin queue into one send
+// per origin run, as a prior version of this did, garbles iv-mode input:
+// lib/interactive-session.js sendText's pending-Enter cancellation means two
+// back-to-back sendToSession calls paste twice into the same input line and
+// submit as one concatenated message). The send itself always carries
+// skipJournalMirror: true; journal mirroring happens out-of-band afterward,
+// once we know the send actually went out — the Matrix-origin text subset
+// via journalPublishUserItem, and any media blocks' deferred journal mirror
+// (Bugbot finding #4 — see lib/media-mirror.js) via journalMirrorUserMedia.
+// A queue entry that never reaches here (cancelled, or the whole queue
+// cleared) simply never has its pending media mirror read — no upload, no
+// publish, no markRead.
+function dispatchMergedFlush(session, queued) {
+  const { blocks, mirrorText } = planQueueFlush(queued);
+  if (blocks.length === 0) return false;
+  if (!sendToSession(session, blocks, { skipJournalMirror: true })) return false;
+  if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+  for (const entry of queued) {
+    for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+  }
+  return true;
+}
+
 function flushQueue(session, queued) {
-  for (const { blocks, journalOrigin } of planQueueFlush(queued)) {
-    if (!sendToSession(session, blocks, { skipJournalMirror: journalOrigin })) {
-      console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
-    }
+  if (!dispatchMergedFlush(session, queued)) {
+    console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
   }
 }
 
@@ -3336,25 +3364,30 @@ async function buildMediaContentBlocks(event, session) {
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, filename);
     fs.writeFileSync(savePath, buffer);
-    journalMirrorUserMedia(session, { buffer, mime, name: filename, dims });
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
+    // Journal mirror (upload + publish + markRead) is deferred to actual
+    // dispatch time — see lib/media-mirror.js. Attaching it here (rather
+    // than calling journalMirrorUserMedia now) is what stops a queued
+    // attachment that later gets cancelled from leaving a phantom journal
+    // entry / advanced read marker for something Claude never saw.
+    attachPendingMediaMirror(blocks, { buffer, mime, name: filename, dims });
     return blocks; // caption already folded in; skip the SDK caption append below
   } else if (content.msgtype === 'm.image') {
     // Save image to workdir
     const imgPath = deduplicateFilename(session.workdir, fileName);
     fs.writeFileSync(imgPath, buffer);
-    journalMirrorUserMedia(session, { buffer, mime, name: fileName, dims });
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
     });
+    attachPendingMediaMirror(blocks, { buffer, mime, name: fileName, dims });
   } else {
     // Save file to workdir
     const savePath = deduplicateFilename(session.workdir, fileName);
     fs.writeFileSync(savePath, buffer);
-    journalMirrorUserMedia(session, { buffer, mime, name: fileName, dims });
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
+    attachPendingMediaMirror(blocks, { buffer, mime, name: fileName, dims });
 
     if (mime === 'application/pdf') {
       blocks.push({
@@ -5112,12 +5145,18 @@ client.on('room.message', async (roomId, event) => {
 
       if (!sendToSession(session, blocks)) {
         await sendReply('Session is not available. Send !start to begin a new one.');
-      } else if (!session.firstMessageCaptured) {
-        session.firstMessageCaptured = true;
-        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-        const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 60)}`;
-        updateRoomName(session.roomId, label);
+      } else {
+        // Media journal mirror (upload + publish + markRead) happens here,
+        // at actual dispatch, not at buildMediaContentBlocks build time —
+        // see lib/media-mirror.js (Bugbot finding #4).
+        for (const payload of pendingMediaMirror(blocks)) journalMirrorUserMedia(session, payload);
+        if (!session.firstMessageCaptured) {
+          session.firstMessageCaptured = true;
+          const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+          const fileName = event.content.body || 'file';
+          const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 60)}`;
+          updateRoomName(session.roomId, label);
+        }
       }
     } catch (err) {
       console.error('Media processing error:', err);
