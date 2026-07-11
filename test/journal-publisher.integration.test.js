@@ -1,9 +1,22 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { existsSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { spawn, execFileSync } from 'child_process';
+import WebSocket from 'ws';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
+
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitFor(predicate, timeoutMs = 5000, intervalMs = 20) {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor: timed out waiting for condition');
+    await delay(intervalMs);
+  }
+}
 
 // Optional end-to-end check against the real matron-journal server code (not
 // a fake). Only runs on boxes that have a matron-journal checkout next to
@@ -20,6 +33,34 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
   let serverProc;
   let serverPort;
   let agentToken;
+  let clientToken;
+
+  // Raw client-device WebSocket helper — stands in for Matron. Not the
+  // publisher under test (that's the agent side); this is the OTHER end of
+  // the wire contract described in the brief (client `send`/`prompt_reply`
+  // ops), driven directly against the real server.
+  async function connectClient() {
+    const ws = new WebSocket(`ws://127.0.0.1:${serverPort}/ws`);
+    await new Promise((resolve, reject) => {
+      ws.on('open', resolve);
+      ws.on('error', reject);
+    });
+    await new Promise((resolve, reject) => {
+      const onMsg = (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (msg.op === 'hello_ok') { ws.off('message', onMsg); resolve(); }
+      };
+      ws.on('message', onMsg);
+      ws.on('error', reject);
+      ws.send(JSON.stringify({ op: 'hello', token: clientToken, cursor: null }));
+    });
+    return {
+      ws,
+      send: (op) => ws.send(JSON.stringify(op)),
+      close: () => ws.close(),
+    };
+  }
 
   beforeAll(async () => {
     tmpDir = mkdtempSync(path.join(tmpdir(), 'matron-journal-it-'));
@@ -56,6 +97,22 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
       serverProc.on('exit', (code) => reject(new Error(`matron-journal server exited early (code ${code}): ${out}`)));
       setTimeout(() => reject(new Error(`matron-journal server did not start in time: ${out}`)), 10000);
     });
+
+    // Client device, provisioned the way Matron itself would be: POST
+    // /login with the same user's credentials. Same user as the agent above
+    // (single-user bridge deployment) so the server fans the client's
+    // send/prompt_reply ops back to the agent socket per the brief's
+    // contract ("fan out to every connected device of that user INCLUDING
+    // the bridge's own agent socket").
+    const loginRes = await fetch(`http://127.0.0.1:${serverPort}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'itest', password: 'itest-pw-12345', device_name: 'matron-itest' }),
+    });
+    if (!loginRes.ok) throw new Error(`client /login failed: HTTP ${loginRes.status}`);
+    const loginBody = await loginRes.json();
+    clientToken = loginBody.token;
+    if (!clientToken) throw new Error(`client /login did not return a token: ${JSON.stringify(loginBody)}`);
   }, 30000);
 
   afterAll(async () => {
@@ -189,5 +246,135 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
       // Leg 1 (today's server: no /media route yet) — fails open to null.
       expect(result).toBeNull();
     }
+  }, 15000);
+
+  // The journal return path itself: a real client device (Matron stand-in)
+  // sends `send` and `prompt_reply` ops against a convo the agent owns; the
+  // agent-side publisher's onEvent must see each exactly once, cursor
+  // persistence must survive a publisher restart, and a restarted publisher
+  // pointed at the same (intact) cursor file must not redeliver anything
+  // already seen.
+  it('client send + prompt_reply reach the agent publisher\'s onEvent exactly once; restart with the cursor file intact redelivers nothing', async () => {
+    const convoId = `itest-return-${Date.now()}`;
+    const cursorDir = mkdtempSync(path.join(tmpdir(), 'journal-cursor-it-'));
+    const cursorFile = path.join(cursorDir, 'cursor.json');
+
+    const delivered1 = [];
+    const pub1 = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+      cursorFile,
+      onEvent: (frame) => delivered1.push(frame),
+    });
+
+    // The convo must exist before a client can send into it (server-side
+    // FK-style check in journal.js append()) — exactly like a real bridge
+    // session existing before Matron replies into it.
+    pub1.upsertConvo(convoId, { title: 'Return-path integration convo', sessionState: 'running' });
+
+    const client = await connectClient();
+    client.send({ op: 'send', convo_id: convoId, type: 'text', payload: { body: 'hello from matron' } });
+    client.send({ op: 'prompt_reply', convo_id: convoId, target_seq: 1, choice: 'opt_a', text: null });
+
+    // The agent's own upsertConvo also round-trips back to it as
+    // agent-sender frames (session_status, convo_meta) — the same fan-out-
+    // to-every-device-including-the-sender behavior the brief's loop-
+    // prevention rule exists for. Filter to the client's own sender identity
+    // to isolate the two events under test.
+    await waitFor(() => delivered1.filter(f => f.convo_id === convoId && f.sender === 'user:itest').length >= 2);
+    await delay(150); // give any stray redelivery a chance to show up before we assert exactly-once
+
+    const ours1 = delivered1.filter(f => f.convo_id === convoId && f.sender === 'user:itest');
+    expect(ours1.length).toBe(2);
+    expect(ours1.map(f => f.type)).toEqual(['text', 'prompt_reply']);
+    expect(ours1.every(f => f.sender === 'user:itest')).toBe(true);
+    expect(ours1[0].payload).toEqual({ body: 'hello from matron' });
+    expect(ours1[1].payload).toEqual({ target_seq: 1, choice: 'opt_a', text: null });
+
+    // Cursor file must reflect the highest seq seen (close() flushes any
+    // still-debounced write synchronously).
+    pub1.close();
+    const persisted = JSON.parse(readFileSync(cursorFile, 'utf-8'));
+    expect(persisted.cursor).toBeGreaterThanOrEqual(ours1[1].seq);
+
+    // Restart: a fresh publisher instance pointed at the same cursor file —
+    // simulates a bridge restart with no new client traffic in between.
+    const delivered2 = [];
+    const pub2 = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+      cursorFile,
+      onEvent: (frame) => delivered2.push(frame),
+    });
+    // Give the reconnect+replay window time to happen (there's nothing to
+    // replay past the persisted cursor, so this is asserting an absence).
+    await delay(300);
+    expect(delivered2.filter(f => f.convo_id === convoId).length).toBe(0);
+
+    pub2.close();
+    client.close();
+    rmSync(cursorDir, { recursive: true, force: true });
+  }, 15000);
+
+  // The activity ephemeral's whole point is viewing-scoped, best-effort
+  // delivery (matron-journal src/ws.js `case 'activity'` -> hub.sendEphemeral,
+  // same fan-out path as `stream`): only a device that has told the server
+  // it's currently looking at this convo (`{op:'viewing', convo_id}`) should
+  // ever see a "Claude is thinking…" indicator for it. Drives both a viewing
+  // and a non-viewing client device against the real server and the real hub
+  // coalescing (default 200ms) to prove that scoping, not just that
+  // publishActivity puts bytes on the wire.
+  it('publishActivity: a viewing client device receives the ephemeral; a non-viewing device does not', async () => {
+    const convoId = `itest-activity-${Date.now()}`;
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+    });
+
+    const viewer = await connectClient();
+    const bystander = await connectClient(); // never sends `viewing` for this convo
+
+    const viewerFrames = [];
+    const bystanderFrames = [];
+    const collect = (arr) => (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      arr.push(msg);
+    };
+    viewer.ws.on('message', collect(viewerFrames));
+    bystander.ws.on('message', collect(bystanderFrames));
+
+    viewer.send({ op: 'viewing', convo_id: convoId });
+
+    // The convo must exist (authorize() checks ownership against the
+    // conversations table) before `activity` is accepted — same requirement
+    // as every other agent op against a convo_id. Wait for the viewer's own
+    // durable-journal copy of the upsert (kind:'journal', broadcast to every
+    // device regardless of viewing state) to confirm the server has actually
+    // processed it, not just that our socket sent it, before publishing the
+    // ephemeral.
+    pub.upsertConvo(convoId, { title: 'Activity ephemeral probe', sessionState: 'running' });
+    await waitFor(() => viewerFrames.some(f => f.kind === 'journal' && f.convo_id === convoId));
+
+    pub.publishActivity(convoId, 'tool', 'rake test:run');
+
+    await waitFor(() => viewerFrames.some(f => f.kind === 'ephemeral' && f.convo_id === convoId));
+    await delay(300); // full hub coalesce window (200ms) + margin, so an absence assertion is meaningful
+
+    const viewerEphemerals = viewerFrames.filter(f => f.kind === 'ephemeral' && f.convo_id === convoId);
+    expect(viewerEphemerals.length).toBe(1);
+    expect(viewerEphemerals[0]).toMatchObject({
+      kind: 'ephemeral', convo_id: convoId, activity: { state: 'tool', detail: 'rake test:run' },
+    });
+
+    const bystanderEphemerals = bystanderFrames.filter(f => f.kind === 'ephemeral' && f.convo_id === convoId);
+    expect(bystanderEphemerals.length).toBe(0);
+
+    pub.close();
+    viewer.close();
+    bystander.close();
   }, 15000);
 });

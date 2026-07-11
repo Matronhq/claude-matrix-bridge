@@ -2,6 +2,9 @@ import { describe, it, expect } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
+import { mkdtempSync, readFileSync, existsSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 // Quiet logger for tests that don't care about warnings.
@@ -43,13 +46,14 @@ function startFakeServer({ onHello, onFrame } = {}, port = 0) {
   const received = [];
   const connections = [];
   wss.on('connection', (ws) => {
-    const conn = { ws, frames: [] };
+    const conn = { ws, frames: [], helloCursor: undefined };
     connections.push(conn);
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
       if (!msg || typeof msg !== 'object') return;
       if (msg.op === 'hello') {
+        conn.helloCursor = msg.cursor ?? null;
         const reply = (onHello && onHello(msg, conn, connections.length - 1)) || { seq: 0 };
         ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: reply.seq ?? 0 }));
         return;
@@ -289,6 +293,7 @@ describe('createJournalPublisher', () => {
       pub.publishToolOutput('c1', { command: 'ls' });
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
       pub.publishImage('c1', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 1, from: 'user' });
+      pub.publishActivity('c1', 'thinking');
       pub.markRead('c1');
       pub.close();
       pub.close(); // idempotent
@@ -313,6 +318,88 @@ describe('createJournalPublisher', () => {
     }).not.toThrow();
 
     await waitFor(() => fake.received.filter(f => f.op === 'convo_upsert').length >= 1);
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity: sends {op, convo_id, state, detail?} once connected, with no idem_key', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    // Prove the connection is really up (hello_ok received, pump ran) via a
+    // queued frame before touching the never-queued publishActivity path.
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.publishActivity('c1', 'thinking');
+    pub.publishActivity('c1', 'tool', 'rake test:run');
+    await waitFor(() => fake.received.filter(f => f.op === 'activity').length >= 2);
+
+    const [f1, f2] = fake.received.filter(f => f.op === 'activity');
+    expect(f1).toEqual({ op: 'activity', convo_id: 'c1', state: 'thinking' });
+    expect(f2).toEqual({ op: 'activity', convo_id: 'c1', state: 'tool', detail: 'rake test:run' });
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity is NOT queued: a call while disconnected is dropped, not replayed after a later reconnect', async () => {
+    const port = await getFreePort(); // nothing listening yet
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.publishActivity('c1', 'thinking'); // must be dropped: no connection yet
+    await delay(80); // let a couple of failed connection attempts happen
+
+    const fake = await startFakeServer({}, port);
+    // Prove the connection did come up (hello_ok round-trip) via a queued
+    // frame, then give a wrongly-replayed activity frame a full window to
+    // show up before asserting its absence.
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+    await delay(80);
+
+    expect(fake.received.some(f => f.op === 'activity')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity is a safe no-op when disabled (no url/token) and never throws', () => {
+    const pub = createJournalPublisher({ url: '', token: '', log: silentLog });
+    expect(() => {
+      pub.publishActivity('c1', 'thinking');
+      pub.publishActivity('c1', 'tool', 'ls');
+    }).not.toThrow();
+  });
+
+  it('publishActivity: an error frame from an older server without the op flows through the existing per-code warn, not a separate mechanism', async () => {
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'activity' ? { kind: 'control', op: 'error', code: 'bad_request', ref: 'activity' } : null),
+    });
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log, ...FAST_BACKOFF });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.publishActivity('c1', 'thinking');
+    pub.publishActivity('c1', 'tool', 'ls');
+    pub.publishActivity('c1', 'idle');
+    await waitFor(() => fake.received.filter(f => f.op === 'activity').length >= 3);
+    await delay(80); // let the rejected error frames round-trip back
+
+    // Exactly one warning for the repeated 'bad_request' code across three
+    // rejected activity sends — the shared per-connection-epoch dedup
+    // (warnedErrorCodes), not a second per-method mechanism.
+    const badRequestWarnings = warnings.filter(w => /bad_request/.test(w));
+    expect(badRequestWarnings.length).toBe(1);
+
+    // Nothing wedged: a normal (queued) publish made afterward still lands.
+    pub.publishText('c1', { body: 'still alive', from: 'user' });
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+
     pub.close();
     await fake.close();
   });
@@ -552,5 +639,268 @@ describe('createJournalPublisher', () => {
     expect(uploadWarnings.length).toBe(1);
 
     pub.close();
+  });
+});
+
+// Inbound journal-frame consumption (Matron -> bridge input) and cursor
+// persistence. Loop-prevention (sender-based filtering) is deliberately NOT
+// tested here — it lives in the index.js consumer (lib/journal-input-router.js),
+// and this module must deliver every kind:'journal' frame — agent-sender
+// echoes included — to onEvent, undiscriminated. See journal-input-router.test.js.
+describe('createJournalPublisher — onEvent + cursor persistence', () => {
+  const FAST_CURSOR = { cursorDebounceMs: 20 };
+
+  function tmpCursorFile() {
+    const dir = mkdtempSync(path.join(tmpdir(), 'journal-cursor-'));
+    return path.join(dir, 'cursor.json');
+  }
+
+  function journalFrame(seq, overrides = {}) {
+    return {
+      kind: 'journal', seq, convo_id: 'c1', ts: Date.now(),
+      sender: 'user:dan', type: 'text', payload: { body: `m${seq}` },
+      ...overrides,
+    };
+  }
+
+  it('delivers inbound journal frames to onEvent, including agent-sender echoes (filtering is index-level)', async () => {
+    const fake = await startFakeServer();
+    const delivered = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      onEvent: (frame) => delivered.push(frame),
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(1, { sender: 'user:dan' })));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(2, { sender: 'agent:dev-2' })));
+
+    await waitFor(() => delivered.length >= 2);
+    expect(delivered.map(f => f.sender)).toEqual(['user:dan', 'agent:dev-2']);
+    expect(delivered.map(f => f.seq)).toEqual([1, 2]);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('without onEvent set, inbound journal frames are ignored (existing publish-only behavior)', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    await waitFor(() => fake.connections.length >= 1);
+    // Must not throw even though nothing is listening for it.
+    expect(() => fake.connections[0].ws.send(JSON.stringify(journalFrame(1)))).not.toThrow();
+    await delay(50);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('persists the max seq seen to cursorFile, debounced', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    // Not written yet — debounce hasn't fired.
+    expect(existsSync(cursorFile)).toBe(false);
+
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(5)));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(3))); // out of order — max must stick at 5
+    await waitFor(() => existsSync(cursorFile));
+    await waitFor(() => JSON.parse(readFileSync(cursorFile, 'utf-8')).cursor === 5);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('no cursor file yet -> first hello carries cursor:null (live-only, never replays as input)', async () => {
+    let helloMsg = null;
+    const fake = await startFakeServer({ onHello: (msg) => { helloMsg = msg; return { seq: 0 }; } });
+    const cursorFile = tmpCursorFile(); // file does not exist
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+
+    await waitFor(() => helloMsg !== null);
+    expect(helloMsg.cursor).toBeNull();
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('reconnect hello carries the persisted cursor', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(7)));
+    await waitFor(() => existsSync(cursorFile) && JSON.parse(readFileSync(cursorFile, 'utf-8')).cursor === 7);
+
+    // Force a reconnect.
+    fake.connections[0].ws.terminate();
+    await waitFor(() => fake.connections.length >= 2, 4000);
+
+    expect(fake.connections[1].helloCursor).toBe(7);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('a fresh publisher pointed at an existing cursor file resumes from it (bridge restart)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    const pub1 = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(42)));
+    await waitFor(() => existsSync(cursorFile) && JSON.parse(readFileSync(cursorFile, 'utf-8')).cursor === 42);
+    pub1.close();
+
+    const pub2 = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    await waitFor(() => fake.connections.length >= 2);
+    expect(fake.connections[1].helloCursor).toBe(42);
+
+    pub2.close();
+    await fake.close();
+  });
+
+  it('dedupes: a frame with seq <= the last delivered seq is never redelivered to onEvent (replay overlap)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    const delivered = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: (f) => delivered.push(f.seq),
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(1)));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(2)));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(3)));
+    await waitFor(() => delivered.length >= 3);
+
+    // Simulate a reconnect replaying from an earlier (debounced) persisted
+    // cursor: seq 2 and 3 arrive again, plus a genuinely new seq 4.
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(2)));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(3)));
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(4)));
+    await waitFor(() => delivered.length >= 4);
+    await delay(50);
+
+    expect(delivered).toEqual([1, 2, 3, 4]);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('snapshot_required + close 4009 resets to live-only and reconnects via existing backoff', async () => {
+    let helloCount = 0;
+    const fake = await startFakeServer({
+      onHello: (msg, conn) => {
+        helloCount += 1;
+        if (helloCount === 1) {
+          // First hello: pretend the gap is too large. Real server sends
+          // hello_ok unconditionally first (the helper does that right after
+          // this callback returns), THEN snapshot_required + close(4009) —
+          // reproduce that ordering with a deferred send.
+          setImmediate(() => {
+            conn.ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }));
+            conn.ws.close(4009);
+          });
+        }
+        return { seq: 0 };
+      },
+    });
+    const cursorFile = tmpCursorFile();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+
+    await waitFor(() => fake.connections.length >= 2, 4000);
+    expect(fake.connections[1].helloCursor).toBeNull();
+    expect(warnings.some(w => /snapshot_required/i.test(w))).toBe(true);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('onEvent exceptions are caught+logged and never kill the socket or queue', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log, ...FAST_BACKOFF, ...FAST_CURSOR,
+      onEvent: () => { throw new Error('boom'); },
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    expect(() => fake.connections[0].ws.send(JSON.stringify(journalFrame(1)))).not.toThrow();
+    await waitFor(() => warnings.some(w => /onEvent/i.test(w) || /boom/.test(w)));
+
+    // The queue/socket must still be healthy: a publish made after the
+    // exception still reaches the server.
+    pub.publishText('c1', { body: 'still alive', from: 'user' });
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('flushCursor() persists the cursor synchronously, bypassing the debounce (command-replay guard)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    let flushedInsideHandler = null;
+    // Deliberately a LONG debounce so a passing test proves the flush path,
+    // not the timer. The onEvent handler force-flushes and inspects the file
+    // synchronously — exactly what index.js does after a control-convo
+    // command or a prompt_reply, so an ungraceful crash inside the debounce
+    // window can't replay an already-executed command.
+    let pub;
+    pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      cursorDebounceMs: 60_000,
+      cursorFile,
+      onEvent: (frame) => {
+        pub.flushCursor();
+        flushedInsideHandler = existsSync(cursorFile)
+          && JSON.parse(readFileSync(cursorFile, 'utf-8')).cursor === frame.seq;
+      },
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(9)));
+    await waitFor(() => flushedInsideHandler !== null);
+    expect(flushedInsideHandler).toBe(true);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('flushCursor() is a safe no-op on the disabled publisher and without a cursorFile', async () => {
+    const disabled = createJournalPublisher({ url: '', token: '', log: silentLog });
+    expect(() => disabled.flushCursor()).not.toThrow();
+
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, onEvent: () => {} });
+    expect(() => pub.flushCursor()).not.toThrow();
+    pub.close();
+    await fake.close();
   });
 });
