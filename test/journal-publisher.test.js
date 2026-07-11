@@ -455,6 +455,41 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('error-code dedup is per connection epoch: warns again after a reconnect, still deduped within each epoch', async () => {
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'read_marker' ? { kind: 'control', op: 'error', code: 'forbidden', ref: 'read_marker' } : null),
+    });
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log, ...FAST_BACKOFF });
+
+    // Epoch 1: two rejected read_markers -> exactly one warning.
+    pub.upsertConvo('c1', {});
+    pub.markRead('c1');
+    pub.markRead('c1');
+    await waitFor(() => fake.received.filter(f => f.op === 'read_marker').length >= 2);
+    await waitFor(() => warnings.filter(w => /forbidden/.test(w)).length >= 1);
+    await delay(60); // let the second rejection's error frame round-trip too
+    expect(warnings.filter(w => /forbidden/.test(w)).length).toBe(1);
+
+    // Server drops the connection; the publisher reconnects (new epoch).
+    fake.connections[0].ws.terminate();
+    await waitFor(() => fake.connections.length >= 2, 4000);
+
+    // Epoch 2: the same 'forbidden' code must be logged once more — a fresh
+    // connection is a fresh observability window, so a later, unrelated
+    // problem that happens to reuse a previously-seen code doesn't stay
+    // permanently invisible. Still deduped within the epoch.
+    pub.markRead('c1');
+    pub.markRead('c1');
+    await waitFor(() => warnings.filter(w => /forbidden/.test(w)).length >= 2, 4000);
+    await delay(60); // let the fourth rejection's error frame round-trip too
+    expect(warnings.filter(w => /forbidden/.test(w)).length).toBe(2);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('uploadMedia: happy path POSTs raw bytes to the derived HTTP base URL with Bearer auth and Content-Type', async () => {
     const httpServer = await startFakeHttpServer();
     // ws:// -> http://, strip trailing /ws, per the fixed contract.
