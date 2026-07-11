@@ -34,6 +34,7 @@ import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-upl
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { activityStateChanged, truncateActivityDetail } from './lib/journal-activity.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -430,6 +431,29 @@ function journalSessionState(session, state) {
   journalUpsertConvo(session, { sessionState: state });
 }
 
+// Mirror the bridge's current activity into an ephemeral typing/activity
+// indicator ('thinking' | 'tool' | 'idle') for viewing Matron clients. Wired
+// at exactly the same call sites as journalSessionState above (busy/prompt/
+// turn-end/exit) plus the sendLiveOutputEvent tool-start seam — see each
+// call site's own comment for which transition it represents.
+//
+// Deliberately NOT journalPublish/journalPublisher directly: activity is
+// EPHEMERAL (see publishActivity's contract in lib/journal-publisher.js),
+// the opposite of journalPublish's buffer-until-session-id semantics — a
+// session whose claudeSessionId isn't known yet is skipped outright here,
+// never buffered for a later flush, because a late-replayed "thinking" would
+// be stale by the time it could go out. Dedup state
+// (session._journalActivityState) is its own field, separate from
+// session._journalState, since the two mirror independent things (durable
+// session_status vs. ephemeral activity) that don't always change together.
+function journalActivity(session, state, detail) {
+  if (!JOURNAL_ENABLED) return;
+  if (!session.claudeSessionId) return;
+  if (!activityStateChanged(session._journalActivityState, state)) return;
+  session._journalActivityState = state;
+  journalPublisher.publishActivity(session.claudeSessionId, state, detail);
+}
+
 // Mirror a user's accepted prompt answer (button tap, numbered/lettered
 // quick-reply, yes-no confirm, free-text prompt reply, AskUserQuestion
 // answer) into the journal as their side of the conversation. These paths
@@ -665,6 +689,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
         journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Pass mcpExtras explicitly: createSession can fall back to persisted
         // state, but a print-mode session that crashes before its session_id
@@ -706,6 +731,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       } else {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -883,6 +909,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // journal must still show 'waiting'. Only the busy/typing cleanup below
     // stays gated.
     journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
     if (session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
@@ -912,6 +939,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
         journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
@@ -946,6 +974,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       } else {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -977,6 +1006,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.turnCount++;
     session.busy = false;
     journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
     // The turn ended, so any best-effort unclassified-prompt notice is stale.
     session.pendingUnclassifiedPrompt = false;
     // A real turn-end supersedes any armed operator-compact fallback: disarm
@@ -1389,6 +1419,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // handler at iv.on('prompt') in createInteractiveSessionForRoom.
   // Unconditional (dedupes internally) — see the matching iv-prompt handler.
   journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
   if (session.busy) {
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
@@ -1447,6 +1478,7 @@ function handleUnclassifiedPrompt(session, { screen }) {
   session.pendingUnclassifiedPrompt = true;
   // Unconditional (dedupes internally) — see the matching iv-prompt handler.
   journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
   // Like a structured prompt, this means claude is awaiting the user — clear
   // busy so the reply is typed into the PTY instead of dropping into the queue.
   if (session.busy) {
@@ -1624,6 +1656,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     }
     session.busy = true;
     journalSessionState(session, 'running');
+    journalActivity(session, 'thinking');
     // This answer goes in via a raw tool_result stdin write (not
     // sendToSession), so mirror the user's side of it here.
     if (mirrorToJournal) journalMirrorUserAnswer(session, answerText);
@@ -2164,6 +2197,7 @@ function handleClaudeEvent(session, event) {
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
+      journalActivity(session, 'idle');
       stripQueueNotificationLinks(session);
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
@@ -2308,6 +2342,12 @@ function handleClaudeEvent(session, event) {
               const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
               const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
               liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
+              // The tracked tool that put us in 'tool' just completed and
+              // Claude continues — back to 'thinking', but only if the turn
+              // isn't already over (a tool_result can still arrive after
+              // 'result'/onTurnEnd already flipped busy false and activity
+              // idle; don't resurrect 'thinking' behind that).
+              if (session.busy) journalActivity(session, 'thinking');
             }
           }
           if (block.type === 'tool_result' && block.is_error) {
@@ -2405,6 +2445,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.toolCalls = [];
   session.busy = true;
   journalSessionState(session, 'running');
+  journalActivity(session, 'thinking');
   // Mirror the user's side of the conversation into the journal. This is the
   // single choke point every real inbound message flows through (directly for
   // media, via sendTextToSession for plain text), so a message is mirrored
@@ -2923,6 +2964,10 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
 
 async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
   journalPublish(session, 'publishToolOutput', { tool_use_id, command, viewer_url, expires_at });
+  // 'tool' activity, detail = the command — the seam the brief calls out
+  // (this function is the one place index.js knows the command string at
+  // tool-start time). Trimmed tighter than the server's own 200-char cap.
+  journalActivity(session, 'tool', truncateActivityDetail(command));
   // Sent as a regular m.room.message with a custom content key:
   // - matron-web-aware clients pick up `chat.matron.live_output` and render
   //   the live viewer tile.

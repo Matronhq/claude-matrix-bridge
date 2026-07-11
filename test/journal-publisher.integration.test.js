@@ -317,4 +317,64 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
     client.close();
     rmSync(cursorDir, { recursive: true, force: true });
   }, 15000);
+
+  // The activity ephemeral's whole point is viewing-scoped, best-effort
+  // delivery (matron-journal src/ws.js `case 'activity'` -> hub.sendEphemeral,
+  // same fan-out path as `stream`): only a device that has told the server
+  // it's currently looking at this convo (`{op:'viewing', convo_id}`) should
+  // ever see a "Claude is thinking…" indicator for it. Drives both a viewing
+  // and a non-viewing client device against the real server and the real hub
+  // coalescing (default 200ms) to prove that scoping, not just that
+  // publishActivity puts bytes on the wire.
+  it('publishActivity: a viewing client device receives the ephemeral; a non-viewing device does not', async () => {
+    const convoId = `itest-activity-${Date.now()}`;
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+    });
+
+    const viewer = await connectClient();
+    const bystander = await connectClient(); // never sends `viewing` for this convo
+
+    const viewerFrames = [];
+    const bystanderFrames = [];
+    const collect = (arr) => (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      arr.push(msg);
+    };
+    viewer.ws.on('message', collect(viewerFrames));
+    bystander.ws.on('message', collect(bystanderFrames));
+
+    viewer.send({ op: 'viewing', convo_id: convoId });
+
+    // The convo must exist (authorize() checks ownership against the
+    // conversations table) before `activity` is accepted — same requirement
+    // as every other agent op against a convo_id. Wait for the viewer's own
+    // durable-journal copy of the upsert (kind:'journal', broadcast to every
+    // device regardless of viewing state) to confirm the server has actually
+    // processed it, not just that our socket sent it, before publishing the
+    // ephemeral.
+    pub.upsertConvo(convoId, { title: 'Activity ephemeral probe', sessionState: 'running' });
+    await waitFor(() => viewerFrames.some(f => f.kind === 'journal' && f.convo_id === convoId));
+
+    pub.publishActivity(convoId, 'tool', 'rake test:run');
+
+    await waitFor(() => viewerFrames.some(f => f.kind === 'ephemeral' && f.convo_id === convoId));
+    await delay(300); // full hub coalesce window (200ms) + margin, so an absence assertion is meaningful
+
+    const viewerEphemerals = viewerFrames.filter(f => f.kind === 'ephemeral' && f.convo_id === convoId);
+    expect(viewerEphemerals.length).toBe(1);
+    expect(viewerEphemerals[0]).toMatchObject({
+      kind: 'ephemeral', convo_id: convoId, activity: { state: 'tool', detail: 'rake test:run' },
+    });
+
+    const bystanderEphemerals = bystanderFrames.filter(f => f.kind === 'ephemeral' && f.convo_id === convoId);
+    expect(bystanderEphemerals.length).toBe(0);
+
+    pub.close();
+    viewer.close();
+    bystander.close();
+  }, 15000);
 });
