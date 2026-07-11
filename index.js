@@ -693,6 +693,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        // Auto-restart is about to replace `session` outright (no
+        // journalSessionState('done') — the convo isn't over, it's
+        // respawning) — but viewers still need to stop seeing a stale
+        // thinking/tool indicator while the process is down. The terminal
+        // exit paths (_autoStopped above, and the final `else` below) both
+        // already emit idle; this branch didn't (Bugbot finding #3).
+        journalActivity(session, 'idle');
         // Pass mcpExtras explicitly: createSession can fall back to persisted
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
@@ -943,6 +950,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        // See the matching print-mode branch's comment: the terminal exit
+        // paths already emit idle on restart, this auto-restart branch
+        // didn't (Bugbot finding #3).
+        journalActivity(session, 'idle');
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
