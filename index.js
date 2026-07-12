@@ -2752,7 +2752,9 @@ function warnIfDisallowed(sender, roomId) {
 // --- Markdown to HTML ---
 
 function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // &quot; matters because escapeHtml output is interpolated into HTML
+  // attributes (href="...") as well as element content.
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function color(text, hex) {
@@ -3178,7 +3180,7 @@ async function maybeUpdatePinnedSummary(session) {
   try {
     // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
     let currentSummary = session.pinnedSummaryText || '';
-    let bulletCount = (currentSummary.match(/^•/gm) || []).length;
+    const bulletCount = (currentSummary.match(/^•/gm) || []).length;
 
     const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 
@@ -3187,7 +3189,6 @@ async function maybeUpdatePinnedSummary(session) {
       const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
       const compactResult = await model.generateContent(compactPrompt);
       currentSummary = compactResult.response.text().trim();
-      bulletCount = (currentSummary.match(/^•/gm) || []).length;
       // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
       session.pinnedSummaryText = currentSummary;
     }
