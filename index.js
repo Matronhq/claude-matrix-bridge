@@ -50,6 +50,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
+import { streamRefFor } from './lib/journal-stream.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -209,6 +210,13 @@ const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
   ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
   : path.join(__dirname, 'journal-cursor.json');
 const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
+// Bridge-side coalescing floor for in-progress assistant-text stream frames
+// (per convo+message). Defaults to the server hub's own ~5/s fan-out window;
+// a non-positive or unparseable value falls back to the publisher default.
+const JOURNAL_STREAM_INTERVAL_MS = (() => {
+  const raw = parseInt(process.env.JOURNAL_STREAM_INTERVAL_MS || '', 10);
+  return Number.isInteger(raw) && raw > 0 ? raw : undefined;
+})();
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -218,6 +226,7 @@ const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL, token: _journalToken, log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
+  ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
@@ -469,6 +478,52 @@ function journalActivity(session, state, detail) {
   journalPublisher.publishActivity(session.claudeSessionId, state, detail);
 }
 
+// Stream in-progress assistant text to viewing Matron clients as an ephemeral
+// overlay. Same skip-if-no-session rule as journalActivity — a session whose
+// claudeSessionId isn't known yet is skipped outright, never buffered: an
+// ephemeral stream frame replayed later would be stale. Mints a stable
+// per-message ref (the message id, see lib/journal-stream.js) so all of one
+// message's deltas coalesce under a single overlay; when Claude moves on to a
+// new message, the previous overlay's pending frames are discarded before the
+// new ref takes over. The current ref lives on the session so flushResponse can
+// thread it into the durable publish (see sendToRoom) and the client retires
+// the overlay by ref. replaceText is the full cumulative message text so far
+// (latest-wins), never a delta — see the publisher's wire-contract comment.
+function journalStream(session, messageId, replaceText) {
+  if (!JOURNAL_ENABLED) return;
+  if (!session.claudeSessionId) return;
+  const nextRef = streamRefFor(session._journalStreamRef, session._journalStreamMsgId, messageId);
+  if (session._journalStreamRef && session._journalStreamRef !== nextRef) {
+    // A new assistant message superseded the previous overlay before it
+    // finalized: drop the old overlay's pending frames so nothing stale lands
+    // under the retired ref (its own durable message retires it separately).
+    journalPublisher.endStream(session.claudeSessionId, session._journalStreamRef);
+  }
+  session._journalStreamRef = nextRef;
+  session._journalStreamMsgId = messageId;
+  journalPublisher.stream(session.claudeSessionId, nextRef, replaceText);
+}
+
+// Retire a still-open streaming overlay that was NOT already retired by a
+// durable publish. Called at every turn-end / session-exit seam alongside
+// journalActivity(session, 'idle'): the normal path already cleared
+// _journalStreamRef when the final message published (carrying the ref), so
+// this only fires for a turn that streamed but produced no durable final
+// message (interruption, /stop, session exit mid-stream) — the "no dangling
+// overlay" case. Sends an empty replace_text so the client collapses the
+// overlay (its finalized-message retire is never coming). Also clears any
+// armed-but-unconsumed durable ref so it can't leak onto a later publish.
+function journalStreamClear(session) {
+  if (!JOURNAL_ENABLED) return;
+  session._journalDurableRef = null;
+  if (!session.claudeSessionId) return;
+  const ref = session._journalStreamRef;
+  if (!ref) return;
+  session._journalStreamRef = null;
+  session._journalStreamMsgId = null;
+  journalPublisher.endStream(session.claudeSessionId, ref, { clear: true });
+}
+
 // Mirror a user's accepted prompt answer (button tap, numbered/lettered
 // quick-reply, yes-no confirm, free-text prompt reply, AskUserQuestion
 // answer) into the journal as their side of the conversation. These paths
@@ -698,6 +753,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 
     // Flush any remaining response
     flushResponse(session);
+    // Process exited mid-stream: collapse any overlay the flush didn't retire
+    // so a viewing client isn't left with a dangling in-progress indicator
+    // (covers the auto-restart, idle-reaper, and clean-exit branches below —
+    // the same convo id may be re-used by an auto-restart, so a stale overlay
+    // must not carry across).
+    journalStreamClear(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -1026,6 +1087,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
     }
+    // No dangling overlay past turn-end (no-op unless this session streamed a
+    // turn that produced no durable final message).
+    journalStreamClear(session);
     // Emit collected tool-call summary if the user has !show_working on.
     if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
       const toolSummary = session.toolCalls.join('\n');
@@ -1914,6 +1978,20 @@ function handleClaudeEvent(session, event) {
         }
         session._lastAssistantMsgId = messageId;
 
+        // Stream in-progress assistant text to viewing Matron clients. Only on
+        // isPartial (stop_reason === null): those are the growing-text deltas
+        // print-mode emits under --include-partial-messages. iv-mode reads
+        // complete messages from the on-disk transcript (no partials), so it
+        // simply gets the durable final message with no overlay — the "they
+        // differ" the brief notes, handled by this gate. Gated on a present
+        // messageId so the overlay keys stably per message. responseBuffer is
+        // the full cumulative text (replace_text, latest-wins). The final
+        // message is retired by the durable publish carrying this ref (see
+        // flushResponse -> sendToRoom), so no stream frame is sent on complete.
+        if (isPartial && messageId) {
+          journalStream(session, messageId, session.responseBuffer);
+        }
+
         // iv-mode: flush this assistant chunk NOW rather than waiting for
         // /turn-end. Two reasons: (1) the Stop hook races the transcript
         // flush so onTurnEnd is unreliable as a flush trigger; (2) claude
@@ -2223,6 +2301,11 @@ function handleClaudeEvent(session, event) {
       } else {
         session.responseBuffer = '';
       }
+      // Retire any streaming overlay the flush above didn't (an interrupted or
+      // text-less turn streamed partials but published no durable final
+      // message) — no dangling overlay past turn-end. No-op on the normal path
+      // (the durable publish already cleared the ref).
+      journalStreamClear(session);
       session.busy = false;
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -2445,6 +2528,16 @@ function flushResponse(session) {
     }
     // Update room name and pinned summary after adding message
     maybeUpdatePinnedSummary(session);
+  }
+
+  // Arm the durable ref for the very next journal mirror (the first chunk's
+  // sendToRoom) so the streamed overlay retires by ref. Only when an overlay is
+  // actually open for this session (print-mode streamed this message) AND a
+  // callback will drive sendToRoom synchronously — otherwise the arm would leak
+  // onto a later, unrelated publish. journalStreamClear (at turn-end) clears
+  // any overlay this flush didn't retire.
+  if (session._journalStreamRef && session.sendCallback) {
+    session._journalDurableRef = session._journalStreamRef;
   }
 
   if (session.sendCallback) {
@@ -3008,7 +3101,29 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
   // no active session (control-room chatter) are silently skipped.
   if (!skipJournalMirror) {
     const journalSession = sessions.get(roomId);
-    if (journalSession) journalPublish(journalSession, 'publishText', { body: text, from: 'assistant' });
+    if (journalSession) {
+      const payload = { body: text, from: 'assistant' };
+      // Thread the streaming overlay's ref into the durable message so a
+      // viewing client retires its overlay by ref (payload.message_ref is the
+      // only channel the server exposes to a client — the durable event shape
+      // strips idem_key). Armed single-shot by flushResponse right before this
+      // call, so the FIRST chunk of a streamed assistant turn carries the ref;
+      // later chunks and unrelated notices publish without it. Consuming it
+      // also discards any still-pending coalesced stream frame for that ref, so
+      // a stale in-progress frame can't land after this finalized message and
+      // resurrect the overlay.
+      const ref = journalSession._journalDurableRef;
+      if (ref) {
+        payload.message_ref = ref;
+        journalSession._journalDurableRef = null;
+        if (journalSession.claudeSessionId) {
+          journalPublisher.endStream(journalSession.claudeSessionId, ref);
+        }
+        journalSession._journalStreamRef = null;
+        journalSession._journalStreamMsgId = null;
+      }
+      journalPublish(journalSession, 'publishText', payload);
+    }
   }
   const content = {
     msgtype: 'm.text',
