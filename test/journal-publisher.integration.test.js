@@ -10,7 +10,10 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitFor(predicate, timeoutMs = 5000, intervalMs = 20) {
+// 10s default: these tests spawn a real matron-journal server, and under full
+// parallel suite load its WS round-trips can exceed 5s (a long-standing flake
+// on the cursor-redelivery test). Still bounded by each it()'s 15-20s timeout.
+async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
   const start = Date.now();
   while (!predicate()) {
     if (Date.now() - start > timeoutMs) throw new Error('waitFor: timed out waiting for condition');
@@ -377,4 +380,124 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
     viewer.close();
     bystander.close();
   }, 15000);
+
+  // Streaming ephemeral, end to end against the real server + hub (same
+  // viewing-scoped fan-out `activity` uses): a viewing client device receives
+  // the coalesced in-progress `stream` frame(s) and then the DURABLE final
+  // message carrying the SAME message_ref in its payload — the only channel the
+  // server exposes to retire the overlay by ref (the durable event shape strips
+  // idem_key). A non-viewing device gets the durable row (broadcast to every
+  // device) but never a stream ephemeral.
+  it('stream: a viewing device gets in-progress frames then the durable final carrying the same ref; a non-viewing device gets no stream frame', async () => {
+    const convoId = `itest-stream-${Date.now()}`;
+    const ref = `msg-${Date.now()}`;
+    const finalText = 'The quick brown fox';
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+      streamIntervalMs: 20,
+    });
+
+    const viewer = await connectClient();
+    const bystander = await connectClient(); // never sends `viewing` for this convo
+
+    const viewerFrames = [];
+    const bystanderFrames = [];
+    const collect = (arr) => (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      arr.push(msg);
+    };
+    viewer.ws.on('message', collect(viewerFrames));
+    bystander.ws.on('message', collect(bystanderFrames));
+
+    viewer.send({ op: 'viewing', convo_id: convoId });
+
+    // The convo must exist before the durable publish (server-side ownership
+    // check); wait for the viewer's durable copy of the upsert to confirm the
+    // server processed it, exactly like the activity test above.
+    pub.upsertConvo(convoId, { title: 'Streaming ephemeral probe', sessionState: 'running' });
+    await waitFor(() => viewerFrames.some(f => f.kind === 'journal' && f.convo_id === convoId));
+
+    // Firehose of in-progress deltas — full cumulative text each time
+    // (replace_text, latest-wins), never an incremental delta.
+    pub.stream(convoId, ref, 'The ');
+    pub.stream(convoId, ref, 'The quick ');
+    pub.stream(convoId, ref, 'The quick brown ');
+    pub.stream(convoId, ref, finalText);
+    await delay(60); // let the bridge's trailing flush fire before we finalize
+
+    await waitFor(() => viewerFrames.some(f => f.kind === 'ephemeral' && f.message_ref === ref));
+    await delay(250); // full hub coalesce window (200ms) + margin
+
+    const viewerStreams = viewerFrames.filter(f => f.kind === 'ephemeral' && f.message_ref === ref);
+    expect(viewerStreams.length).toBeGreaterThanOrEqual(1);
+    // Latest-wins: whatever the viewer ends up with, the newest carries the
+    // final cumulative text — never a lost-delta prefix.
+    expect(viewerStreams[viewerStreams.length - 1].replace_text).toBe(finalText);
+
+    // Durable final message carrying the same ref in its payload — exactly what
+    // sendToRoom does when it consumes _journalDurableRef. endStream first, to
+    // model the bridge discarding any still-pending coalesced frame at finalize.
+    pub.endStream(convoId, ref);
+    pub.publishText(convoId, { body: finalText, from: 'assistant', message_ref: ref });
+
+    await waitFor(() => viewerFrames.some(f => f.kind === 'journal' && f.type === 'text' && f.convo_id === convoId));
+    const durable = viewerFrames.find(f => f.kind === 'journal' && f.type === 'text' && f.convo_id === convoId);
+    expect(durable.payload.message_ref).toBe(ref); // links overlay -> final message
+    expect(durable.payload.body).toBe(finalText);
+
+    // The bystander got the durable row (broadcast) but never a stream ephemeral.
+    await delay(50);
+    const bystanderStreams = bystanderFrames.filter(f => f.kind === 'ephemeral' && f.message_ref === ref);
+    expect(bystanderStreams.length).toBe(0);
+    expect(bystanderFrames.some(f => f.kind === 'journal' && f.type === 'text' && f.convo_id === convoId)).toBe(true);
+
+    pub.close();
+    viewer.close();
+    bystander.close();
+  }, 20000);
+
+  // The "no dangling overlay" path: a turn that streamed but produced no
+  // durable final message (interruption / session exit mid-stream). endStream
+  // with {clear:true} sends a final empty replace_text so a viewing client
+  // collapses the overlay.
+  it('endStream({clear:true}): a viewing device receives a final empty replace_text collapsing the overlay', async () => {
+    const convoId = `itest-stream-clear-${Date.now()}`;
+    const ref = `msg-${Date.now()}`;
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+      streamIntervalMs: 20,
+    });
+
+    const viewer = await connectClient();
+    const viewerFrames = [];
+    viewer.ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      viewerFrames.push(msg);
+    });
+    viewer.send({ op: 'viewing', convo_id: convoId });
+
+    pub.upsertConvo(convoId, { title: 'Overlay clear probe', sessionState: 'running' });
+    await waitFor(() => viewerFrames.some(f => f.kind === 'journal' && f.convo_id === convoId));
+
+    pub.stream(convoId, ref, 'partial in progress');
+    // Wait for the server to actually deliver the in-progress frame (it flushes
+    // its per-(convo,ref) window ~200ms) BEFORE clearing — otherwise the hub's
+    // latest-wins coalescing would collapse the two into just the empty one.
+    await waitFor(() => viewerFrames.some(f => f.kind === 'ephemeral' && f.message_ref === ref && f.replace_text === 'partial in progress'));
+
+    pub.endStream(convoId, ref, { clear: true });
+    await waitFor(() => viewerFrames.some(f => f.kind === 'ephemeral' && f.message_ref === ref && f.replace_text === ''));
+
+    const cleared = viewerFrames.filter(f => f.kind === 'ephemeral' && f.message_ref === ref && f.replace_text === '');
+    expect(cleared.length).toBeGreaterThanOrEqual(1);
+
+    pub.close();
+    viewer.close();
+  }, 20000);
 });
