@@ -703,6 +703,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Auto-restart is about to replace `session` outright (no
         // journalSessionState('done') — the convo isn't over, it's
@@ -752,6 +753,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -960,6 +962,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // See the matching print-mode branch's comment: the terminal exit
         // paths already emit idle on restart, this auto-restart branch
@@ -999,6 +1002,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -3542,6 +3546,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       killSession(session);
       sessions.delete(roomId);
+      journalEvictConvoInput(session);
       // Append [done] to the session room name
       try {
         const nameEvent = await client.getRoomStateEvent(session.roomId, 'm.room.name', '');
@@ -4649,6 +4654,19 @@ const journalInputConsumer = createJournalInputConsumer({
 // been assigned).
 function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
+}
+
+// Evict the reply-staleness guard record for a torn-down session's convo
+// (issue #98 nit — the consumer's per-convo map is otherwise never pruned).
+// Called from every TERMINAL session teardown (the exit handlers' non-restart
+// branches and !stop), alongside the other journal state those sites already
+// settle (journalSessionState 'done' / journalActivity 'idle'). Deliberately
+// NOT called on auto-restart or recreateSession: the same convo (same
+// claudeSessionId) lives on there and its guard record is still meaningful.
+// Hoisted function declaration — the exit handlers are defined earlier in
+// this file but only ever fire long after journalInputConsumer is assigned.
+function journalEvictConvoInput(session) {
+  if (session && session.claudeSessionId) journalInputConsumer.evictConvo(session.claudeSessionId);
 }
 
 // --- Matrix Message Handler ---
