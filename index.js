@@ -44,6 +44,7 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
+import { dispatchBusyQueueMagicWord } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -4314,12 +4315,11 @@ function journalSessionCommandCtx(session) {
 // journal already has this text as the client's own `send` row, so nothing
 // here may publish a duplicate agent-sourced echo of it.
 //
-// Scope note (v1): the Matrix handler's plan-mode "build" keyword and the
-// busy-queue magic words (bare "send"/"interrupt"/"cancel", which edit a
-// Matrix notification message by event ID) are NOT reproduced here — both
-// remain reachable from the session's still-fully-synced Matrix room.
-// Everything else a plain typed reply — or a bridge command — can do, a
-// Matron text message can do too.
+// Scope note: the busy-queue magic words (bare "send"/"interrupt"/"cancel")
+// are reproduced below via the shared lib/busy-queue.js implementation the
+// Matrix busy branch also uses — with journal-appropriate feedback (fresh
+// texts; no Matrix notification edits). Everything a plain typed reply — or
+// a bridge command — can do, a Matron text message can do too.
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -4435,6 +4435,23 @@ async function journalRouteTextToSession(session, body) {
       sendTextToSession(session, trimmed, { skipJournalMirror: true });
       return;
     }
+    // Busy-queue magic words — the SAME classifier and implementation the
+    // Matrix busy branch uses (lib/busy-queue.js), checked at the same point
+    // (busy, not a TUI slash passthrough). Journal-appropriate seams only:
+    // feedback goes through ctx.sendReply — a fresh sendToRoom text that
+    // also mirrors into the journal, like every other command reply — and no
+    // editMessage/stripQueueNotificationLinks are passed, because the
+    // journal protocol has no message editing (the Matrix "📨 Queued" tiles
+    // are left as-is). A flush still goes through the one true flushQueue
+    // (single merged send + origin-aware mirroring, PR #100) — never a
+    // second flush path.
+    const ctx = journalSessionCommandCtx(session);
+    const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
+      sendReply: ctx.sendReply,
+      formatQueueSummary,
+      flushQueue,
+    });
+    if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
     // eventual flushQueue send skips the journal mirror — the journal
     // already has this text as the client's own send row, and re-mirroring
@@ -5096,49 +5113,22 @@ client.on('room.message', async (roomId, event) => {
     }
   }
   if (session.busy && !isClaudeSlashCommand) {
-    const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
-      const queued = session.queuedMessages || [];
-      session.queuedMessages = null;
-      stripQueueNotificationLinks(session);
-      if (queued.length > 0) {
-        const summary = formatQueueSummary(queued);
-        if (sendHtmlFn) {
-          const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
-          const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
-          await sendHtmlFn(plainMsg, htmlMsg);
-        } else {
-          await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
-        }
-        flushQueue(session, queued);
-      } else {
-        await sendReply('⚡ No queued messages to send.');
-      }
-      return;
-    }
-    if (lowerText === 'cancel') {
-      const queue = session.queuedMessages || [];
-      const notifs = session.queueNotifications || [];
-      if (queue.length === 0) {
-        await sendReply('No queued messages to cancel.');
-        return;
-      }
-      queue.pop();
-      if (notifs.length > 0) {
-        const { eventId, plain } = notifs.pop();
-        if (eventId) {
-          await editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
-        }
-      }
-      const remaining = queue.length;
-      if (remaining === 0) {
-        session.queuedMessages = null;
-      }
-      await sendReply(remaining === 0
-        ? 'Cancelled queued message (queue empty).'
-        : `Cancelled queued message (${remaining} remaining).`);
-      return;
-    }
+    // Busy-queue magic words: bare send/interrupt/!interrupt flush the queue
+    // now; bare cancel pops the last queued message. Classification and
+    // implementation are shared with the journal session-text route
+    // (classifyBusyMagicWord in lib/command-dispatch.js +
+    // lib/busy-queue.js) so the two transports can't fork — the Matrix-only
+    // notification edits ride in as the stripQueueNotificationLinks /
+    // editMessage seams, which the journal caller simply doesn't pass.
+    const handledMagicWord = await dispatchBusyQueueMagicWord(text, session, {
+      sendReply,
+      sendHtml: sendHtmlFn,
+      formatQueueSummary,
+      flushQueue,
+      stripQueueNotificationLinks,
+      editMessage,
+    });
+    if (handledMagicWord) return;
     // Queue the message
     if (!session.queuedMessages) session.queuedMessages = [];
     if (!session.queueNotifications) session.queueNotifications = [];

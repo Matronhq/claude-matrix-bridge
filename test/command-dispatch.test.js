@@ -3,6 +3,7 @@ import {
   BRIDGE_COMMAND_NAMES,
   classifyBridgeCommand,
   classifyRescueKeystroke,
+  classifyBusyMagicWord,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
@@ -119,6 +120,43 @@ describe('classifyRescueKeystroke (Matrix regression pin: !esc)', () => {
   it('returns null for non-string input', () => {
     expect(classifyRescueKeystroke(null)).toBeNull();
     expect(classifyRescueKeystroke(undefined)).toBeNull();
+  });
+});
+
+// Busy-queue magic words (PR #101 follow-up). While a session is busy, bare
+// send/interrupt/!interrupt flush the queue and bare cancel pops the last
+// queued message — Matrix behavior pinned here, now shared with the journal
+// session-text route (lib/busy-queue.js). Classification only: the busy
+// gating lives at the call sites (and in dispatchBusyQueueMagicWord).
+describe('classifyBusyMagicWord (Matrix regression pins)', () => {
+  it("classifies the flush words exactly as the Matrix busy branch compared them", () => {
+    expect(classifyBusyMagicWord('send')).toBe('send');
+    expect(classifyBusyMagicWord('interrupt')).toBe('send');
+    expect(classifyBusyMagicWord('!interrupt')).toBe('send');
+  });
+
+  it('classifies cancel', () => {
+    expect(classifyBusyMagicWord('cancel')).toBe('cancel');
+  });
+
+  it('is case-insensitive and trims whitespace, like the Matrix lowerText comparison', () => {
+    expect(classifyBusyMagicWord('  SEND ')).toBe('send');
+    expect(classifyBusyMagicWord('Cancel')).toBe('cancel');
+    expect(classifyBusyMagicWord(' !Interrupt ')).toBe('send');
+  });
+
+  it('returns null for anything else — including near-misses that must queue as ordinary text', () => {
+    expect(classifyBusyMagicWord('send it')).toBeNull();
+    expect(classifyBusyMagicWord('/interrupt')).toBeNull();
+    expect(classifyBusyMagicWord('!send')).toBeNull();
+    expect(classifyBusyMagicWord('cancel:0')).toBeNull();
+    expect(classifyBusyMagicWord('')).toBeNull();
+  });
+
+  it('returns null for non-string input rather than throwing', () => {
+    expect(classifyBusyMagicWord(null)).toBeNull();
+    expect(classifyBusyMagicWord(undefined)).toBeNull();
+    expect(classifyBusyMagicWord(7)).toBeNull();
   });
 });
 
