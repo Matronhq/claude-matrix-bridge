@@ -2752,7 +2752,9 @@ function warnIfDisallowed(sender, roomId) {
 // --- Markdown to HTML ---
 
 function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // &quot; matters because escapeHtml output is interpolated into HTML
+  // attributes (href="...") as well as element content.
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function color(text, hex) {
@@ -2820,8 +2822,14 @@ function markdownToHtml(text) {
     // Markdown links: [text](url)
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
 
-    // Linkify remaining bare URLs (not already inside tags)
-    html = html.replace(/(?<!href="|">)(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
+    // Linkify remaining bare URLs (not already inside tags). The text is
+    // already escapeHtml'd, so a quote right after a URL appears as
+    // &quot;/&#39; — stop the match at those entities or they get absorbed
+    // into the href. (&lt;/&gt; are deliberately NOT terminators: a literal
+    // > inside a URL has always been absorbed as &gt; and decodes back to >
+    // when the client parses the attribute, so stopping there would change
+    // currently-correct rendering.)
+    html = html.replace(/(?<!href="|">)(https?:\/\/(?:(?!&quot;|&#39;)[^\s<>"'])+)/g, '<a href="$1">$1</a>');
 
     // Horizontal rules
     html = html.replace(/^-{3,}$/gm, '<hr/>');
@@ -3178,7 +3186,7 @@ async function maybeUpdatePinnedSummary(session) {
   try {
     // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
     let currentSummary = session.pinnedSummaryText || '';
-    let bulletCount = (currentSummary.match(/^•/gm) || []).length;
+    const bulletCount = (currentSummary.match(/^•/gm) || []).length;
 
     const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 
@@ -3187,7 +3195,6 @@ async function maybeUpdatePinnedSummary(session) {
       const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
       const compactResult = await model.generateContent(compactPrompt);
       currentSummary = compactResult.response.text().trim();
-      bulletCount = (currentSummary.match(/^•/gm) || []).length;
       // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
       session.pinnedSummaryText = currentSummary;
     }
@@ -3359,7 +3366,12 @@ async function buildMediaContentBlocks(event, session) {
   if (!mxcUrl) return blocks;
 
   const buffer = await downloadMatrixFile(mxcUrl, content.file);
-  const fileName = content.body || 'file';
+  // fileName is used as a path segment for workdir saves below — basename()
+  // strips directory components a malicious/odd Matrix body might carry
+  // (mirrors resolveUploadMeta in lib/iv-uploads.js; '.'/'..' survive
+  // basename, so fold them into the fallback).
+  const rawFileName = path.basename(content.body || 'file');
+  const fileName = rawFileName === '' || rawFileName === '.' || rawFileName === '..' ? 'file' : rawFileName;
   const mime = content.info?.mimetype || 'application/octet-stream';
   // Matrix image events commonly carry width/height in `info` — cheap to
   // reuse for the journal's optional image dims, no image lib needed.
