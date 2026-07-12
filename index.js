@@ -32,7 +32,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
-import { readSessionSummary, listSessionSummaries } from './lib/session-summary.js';
+import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   classifyBridgeCommand,
   classifyRescueKeystroke,
@@ -3609,19 +3609,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
+      if (!(await pathExists(projectDir))) {
         await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
         return;
       }
 
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => f.replace('.jsonl', ''))
-        .sort((a, b) => {
-          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-          return sb.mtimeMs - sa.mtimeMs;
-        });
+      // Async id resolution (issue #102): the old inline version ran a
+      // synchronous readdir and then a synchronous stat INSIDE the sort
+      // comparator — O(n log n) blocking metadata calls on the event loop.
+      // Same ordering and fallbacks, one stat per file, via fs.promises
+      // (lib/session-summary.js; the no-sync-fs pin lives in
+      // test/session-summary.test.js's source-inspection block).
+      const files = await listSessionIdsByMtime(projectDir);
 
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
@@ -3646,7 +3645,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             const altEncoded = foundEntry.workdir.replace(/\//g, '-');
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (fs.existsSync(altFile)) {
+            if (await pathExists(altFile)) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
             }
@@ -3856,7 +3855,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const encodedPath = workdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
+      if (!(await pathExists(projectDir))) {
         await sendReply('No sessions found for this workdir.');
         break;
       }
