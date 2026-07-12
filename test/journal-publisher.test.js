@@ -373,6 +373,121 @@ describe('createJournalPublisher', () => {
     }).not.toThrow();
   });
 
+  it('stream: sends {op, convo_id, message_ref, replace_text} once connected, with no idem_key', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, streamIntervalMs: 40 });
+
+    // Prove the socket is really up before touching the never-queued path.
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.stream('c1', 'm1', 'Hello');
+    await waitFor(() => fake.received.filter(f => f.op === 'stream').length >= 1);
+
+    const f1 = fake.received.filter(f => f.op === 'stream')[0];
+    expect(f1).toEqual({ op: 'stream', convo_id: 'c1', message_ref: 'm1', replace_text: 'Hello' });
+    expect(f1.idem_key).toBeUndefined();
+    expect(f1.text).toBeUndefined(); // never an incremental delta, always replace_text
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('stream: coalesces a rapid burst to a leading + single trailing frame, latest text wins', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, streamIntervalMs: 60 });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    // Firehose: leading 'A' goes out immediately; 'B','C','D' land inside the
+    // window and collapse to one trailing frame carrying the latest ('D').
+    pub.stream('c1', 'm1', 'A');
+    pub.stream('c1', 'm1', 'B');
+    pub.stream('c1', 'm1', 'C');
+    pub.stream('c1', 'm1', 'D');
+
+    await waitFor(() => fake.received.filter(f => f.op === 'stream').length >= 2);
+    await delay(120); // well past the window — prove nothing extra trickles in
+
+    const texts = fake.received.filter(f => f.op === 'stream').map(f => f.replace_text);
+    expect(texts).toEqual(['A', 'D']);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('stream is NOT queued: a call while disconnected is dropped, not replayed after a later reconnect', async () => {
+    const port = await getFreePort(); // nothing listening yet
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, ...FAST_BACKOFF, streamIntervalMs: 40 });
+
+    pub.stream('c1', 'm1', 'lost'); // must be dropped: no connection yet
+    await delay(80);
+
+    const fake = await startFakeServer({}, port);
+    pub.upsertConvo('c1', {}); // prove the reconnect handshake completed
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+    await delay(80);
+
+    expect(fake.received.some(f => f.op === 'stream')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('endStream discards a pending coalesced frame so nothing stale lands after finalize', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, streamIntervalMs: 80 });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.stream('c1', 'm1', 'partial-A'); // leading -> sent now
+    pub.stream('c1', 'm1', 'partial-B'); // coalesced -> pending trailing frame
+    // Turn finalizes before the trailing timer fires: discard the pending frame.
+    pub.endStream('c1', 'm1');
+
+    await waitFor(() => fake.received.filter(f => f.op === 'stream').length >= 1);
+    await delay(150); // longer than the window: a discarded frame must never appear
+
+    const texts = fake.received.filter(f => f.op === 'stream').map(f => f.replace_text);
+    expect(texts).toEqual(['partial-A']); // 'partial-B' was dropped by endStream
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('endStream({clear:true}) emits one final empty replace_text to collapse a dangling overlay', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, streamIntervalMs: 40 });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.stream('c1', 'm1', 'in progress…');
+    await waitFor(() => fake.received.filter(f => f.op === 'stream').length >= 1);
+
+    pub.endStream('c1', 'm1', { clear: true });
+    await waitFor(() => fake.received.filter(f => f.op === 'stream' && f.replace_text === '').length >= 1);
+
+    const cleared = fake.received.filter(f => f.op === 'stream' && f.replace_text === '');
+    expect(cleared.length).toBe(1);
+    expect(cleared[0]).toEqual({ op: 'stream', convo_id: 'c1', message_ref: 'm1', replace_text: '' });
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('stream/endStream are safe no-ops when disabled (no url/token) and never throw', () => {
+    const pub = createJournalPublisher({ url: '', token: '', log: silentLog });
+    expect(() => {
+      pub.stream('c1', 'm1', 'x');
+      pub.endStream('c1', 'm1');
+      pub.endStream('c1', 'm1', { clear: true });
+    }).not.toThrow();
+  });
+
   it('publishActivity: an error frame from an older server without the op flows through the existing per-code warn, not a separate mechanism', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
