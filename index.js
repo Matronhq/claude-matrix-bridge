@@ -39,6 +39,7 @@ import {
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
+  dispatchPlanBuild,
   classifyJournalControlCommand,
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
@@ -4306,8 +4307,9 @@ function journalSessionCommandCtx(session) {
 // pending-TUI-prompt resolution (maybeResolveInteractivePrompt, same
 // parseOptionReply-driven logic a typed Matrix reply uses), the
 // detector-missed "unclassified prompt" menu guard, print-mode
-// AskUserQuestion resolution, iv-mode PTY rescue keystrokes
-// (classifyRescueKeystroke), THEN busy-queueing (with the same
+// AskUserQuestion resolution, the plan-mode `build` keyword
+// (dispatchPlanBuild + the shared approvePlanBuild), iv-mode PTY rescue
+// keystrokes (classifyRescueKeystroke), THEN busy-queueing (with the same
 // TUI-slash-passthrough bypass Matrix uses), THEN a normal turn — using the
 // exact same session state (queuedMessages, pendingInteractivePrompt,
 // pendingUnclassifiedPrompt) a Matrix message would, rather than a second
@@ -4384,6 +4386,26 @@ async function journalRouteTextToSession(session, body) {
     }
     return;
   }
+
+  // Plan-mode `build` keyword — the SAME decision gate and approval
+  // implementation as the Matrix handler (dispatchPlanBuild +
+  // approvePlanBuild), checked at the same position in the ordering: after
+  // prompt/menu/question resolution, before rescue keystrokes and
+  // busy-queueing. With no pending plan, `build` falls through and routes to
+  // Claude as ordinary text, exactly like Matrix. The "▶️ Building..."
+  // notice goes through the session ctx's sendHtml (sendToRoom), which
+  // mirrors into the journal like every other bridge reply.
+  const dispatchedBuild = await dispatchPlanBuild(
+    trimmed,
+    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    {
+      approvePlan: () => {
+        const ctx = journalSessionCommandCtx(session);
+        return approvePlanBuild(session, { sendHtml: ctx.sendHtml });
+      },
+    },
+  );
+  if (dispatchedBuild) return;
 
   // iv-mode PTY rescue keystrokes (!enter/!esc/!escape/!stop) — same
   // classifier and same session.iv.sendKeystroke calls the Matrix handler
@@ -4685,6 +4707,92 @@ function journalEvictConvoInput(session) {
   if (session && session.claudeSessionId) journalInputConsumer.evictConvo(session.claudeSessionId);
 }
 
+// Plan approval for the `build` keyword — the Matrix handler's original
+// build block, extracted verbatim so the journal session-text route runs
+// the SAME code path (PR #101 follow-up; decision gate: dispatchPlanBuild,
+// lib/command-dispatch.js). iv-mode resolves the pending /plan-decision
+// hook with allow; print-mode does the tool_result/denial dance (or falls
+// back to a plain approval message when the denial was already answered).
+// `sendHtml` is the transport's reply sink for the final "▶️ Building..."
+// notice — Matrix passes its room sink, the journal passes the session
+// ctx's sendToRoom sink, which also mirrors into the journal.
+async function approvePlanBuild(session, { sendHtml }) {
+  const toolUseId = session.pendingPlanDenialId;
+  console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+
+  // Check if a tool_result already exists in the session history for this tool_use_id.
+  // Claude CLI auto-generates a tool_result for permission denials, so sending another
+  // one causes a duplicate tool_result API 400 error.
+  const alreadyAnswered = toolUseId && session.claudeSessionId
+    ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+    : false;
+  console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
+
+  if (session.iv) {
+    // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
+    // it with allow so the hook returns and claude proceeds naturally.
+    // No stdin.write or follow-up text needed — the hook's allow decision
+    // unblocks the original tool call and claude continues its turn.
+    const pending = session.ivPendingPlanToolUseId
+      ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
+      : null;
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    session.ivPendingPlanToolUseId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    if (pending) {
+      console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+      pending.resolve({ decision: 'allow', reason: 'approved by user' });
+    } else {
+      console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    }
+  } else if (!toolUseId || alreadyAnswered) {
+    // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
+    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+  } else {
+    // No existing tool_result — send tool_result to properly exit plan mode
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    session.busy = true;
+    const jsonMsg = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            tool_use_id: toolUseId,
+            type: 'tool_result',
+            content: 'Plan approved by user.',
+          },
+          {
+            type: 'text',
+            text: 'Go ahead and execute the plan now.',
+          }
+        ]
+      }
+    }) + '\n';
+    console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
+    session.proc.stdin.write(jsonMsg);
+    if (session.resetTimeout) session.resetTimeout();
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  }
+  const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
+  await sendHtml(buildNotice.plain, buildNotice.html);
+}
+
 // --- Matrix Message Handler ---
 
 client.on('room.message', async (roomId, event) => {
@@ -4963,85 +5071,18 @@ client.on('room.message', async (roomId, event) => {
     return;
   }
 
-  // Handle text "build" for plan approval
+  // Handle text "build" for plan approval. Decision (exact keyword + the
+  // pending-plan gate) is shared with the journal session-text route via
+  // dispatchPlanBuild (lib/command-dispatch.js); the implementation is the
+  // shared approvePlanBuild below — extracted verbatim from the block that
+  // used to live here, so both transports run the SAME code path.
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId)) {
-    const toolUseId = session.pendingPlanDenialId;
-    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
-
-    // Check if a tool_result already exists in the session history for this tool_use_id.
-    // Claude CLI auto-generates a tool_result for permission denials, so sending another
-    // one causes a duplicate tool_result API 400 error.
-    const alreadyAnswered = toolUseId && session.claudeSessionId
-      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
-      : false;
-    console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
-
-    if (session.iv) {
-      // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
-      // it with allow so the hook returns and claude proceeds naturally.
-      // No stdin.write or follow-up text needed — the hook's allow decision
-      // unblocks the original tool call and claude continues its turn.
-      const pending = session.ivPendingPlanToolUseId
-        ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
-        : null;
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      session.ivPendingPlanToolUseId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      if (pending) {
-        console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
-        pending.resolve({ decision: 'allow', reason: 'approved by user' });
-      } else {
-        console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
-        sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
-      }
-    } else if (!toolUseId || alreadyAnswered) {
-      // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
-      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
-    } else {
-      // No existing tool_result — send tool_result to properly exit plan mode
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      session.busy = true;
-      const jsonMsg = JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content: [
-            {
-              tool_use_id: toolUseId,
-              type: 'tool_result',
-              content: 'Plan approved by user.',
-            },
-            {
-              type: 'text',
-              text: 'Go ahead and execute the plan now.',
-            }
-          ]
-        }
-      }) + '\n';
-      console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-      session.proc.stdin.write(jsonMsg);
-      if (session.resetTimeout) session.resetTimeout();
-      if (session.typingInterval) clearInterval(session.typingInterval);
-      session.typingInterval = startTyping(session.roomId);
-    }
-    const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
-    await sendHtmlFn(buildNotice.plain, buildNotice.html);
-    return;
-  }
+  const handledBuild = await dispatchPlanBuild(
+    text,
+    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    { approvePlan: () => approvePlanBuild(session, { sendHtml: sendHtmlFn }) },
+  );
+  if (handledBuild) return;
 
   // User sent feedback on the plan (not "build") — clear plan state and forward as message.
   // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
