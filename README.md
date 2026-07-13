@@ -3,7 +3,7 @@
 Chat with Claude Code CLI sessions from anywhere. The bridge spawns and manages Claude Code sessions on your dev box and connects them to two transports:
 
 - **Matrix** — messages arrive in per-session Matrix rooms (E2EE-capable when `ENCRYPT_SESSION_ROOMS=1`), so any Matrix client works.
-- **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-iOS-app), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
+- **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
 
 Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping.
 
