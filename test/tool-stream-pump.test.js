@@ -192,17 +192,19 @@ describe('createToolStreamPump', () => {
   });
 
   it('slices a large backlog into chunkBytes frames on UTF-8 boundaries', async () => {
-    // 3-byte chars with chunkBytes 8: cut would land mid-char at byte 8, so
-    // each frame must hold 2 chars (6 bytes), never a torn one.
-    const { sink, pump, cleanup } = setup({ preContent: 'ééé'.repeat(2), chunkBytes: 8 });
+    // 2-byte char (é) with chunkBytes 7 (odd): cut at byte 7 lands mid-character,
+    // forcing the tear-and-resume logic. Content is 24 bytes; each frame up to the
+    // last will hold 3 complete chars (6 bytes), and the logic must hold back the
+    // split char and resume it in the next pump cycle.
+    const { sink, pump, cleanup } = setup({ preContent: 'ééé'.repeat(4), chunkBytes: 7 });
     try {
       pump.start();
-      await waitFor(() => sink.content() === 'éééééé');
+      await waitFor(() => sink.content() === 'ééé'.repeat(4));
+      // Verify we got more than one frame (the windowing actually engaged).
       expect(sink.frames.length).toBeGreaterThan(1);
-      for (const f of sink.frames) {
-        expect(f.chunk.includes('�')).toBe(false);
-      }
-      // Offsets are contiguous in bytes.
+      // Verify reassembled content has no U+FFFD replacement chars.
+      expect(sink.content().includes('�')).toBe(false);
+      // Offsets are contiguous and byte-exact.
       let expected = 0;
       for (const f of [...sink.frames].sort((a, b) => a.offset - b.offset)) {
         expect(f.offset).toBe(expected);
@@ -259,6 +261,23 @@ describe('createToolStreamPump', () => {
       pump.resync(0);
       await delay(80);
       expect(sink.content()).toBe('a');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('clamps chunkBytes below 4 to prevent permanent stall on multi-byte splits', async () => {
+    // Pass chunkBytes: 1 (narrower than any UTF-8 character); the clamping logic
+    // must enforce a minimum of 4. Content 'aé' is 3 bytes (a=1, é=2), so even
+    // a 4-byte window can hold it completely on the first pump call.
+    const { sink, pump, cleanup } = setup({ preContent: 'aé', chunkBytes: 1 });
+    try {
+      pump.start();
+      await waitFor(() => sink.content() === 'aé');
+      expect(sink.frames.length).toBe(1);
+      expect(sink.frames[0].chunk).toBe('aé');
+      // Verify no corruption or replacement chars.
+      expect(sink.content()).toBe('aé');
     } finally {
       cleanup();
     }
