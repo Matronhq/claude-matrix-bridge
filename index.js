@@ -12,7 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
-import { generateSignedUrl } from './lib/viewer-tokens.js';
+import { createToolStreamPump } from './lib/tool-stream-pump.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
@@ -180,7 +180,7 @@ const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
 sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
-  console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
+  console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
 }
 
 // Journal dual-post (migration off Matrix — see matron-journal's protocol
@@ -218,6 +218,15 @@ const JOURNAL_STREAM_INTERVAL_MS = (() => {
   const raw = parseInt(process.env.JOURNAL_STREAM_INTERVAL_MS || '', 10);
   return Number.isInteger(raw) && raw > 0 ? raw : undefined;
 })();
+// Active tool-output stream pumps, keyed `${convoId}\0${messageRef}` — the
+// same key the server buffers under. Registered by the Bash tool_use seam,
+// drained by stopAndFinalizeToolStream (tool_result) and killSession.
+// Module-level rather than per-session so the single onStreamResync
+// dispatcher below can route a server resync to its pump directly.
+const toolStreamPumps = new Map();
+function toolStreamKey(convoId, messageRef) {
+  return `${convoId}\0${messageRef}`;
+}
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -227,6 +236,9 @@ const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL, token: _journalToken, log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
+  onStreamResync: (convoId, messageRef, have) => {
+    toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
+  },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -2144,37 +2156,46 @@ function handleClaudeEvent(session, event) {
                 logPath: liveLogPath,
                 roomId: session.roomId,
               });
-              const expiresAt = Math.floor(Date.now() / 1000) + LIVE_OUTPUT_TTL;
-              if (HMAC_SECRET && VIEWER_BASE_URL) {
-                const viewerUrl = generateSignedUrl(
-                  VIEWER_BASE_URL,
-                  null,
-                  HMAC_SECRET,
-                  LIVE_OUTPUT_TTL,
-                  { liveCmdId: liveToolUseId, logPath: liveLogPath, doneSentinelPath: `${liveLogPath}.done` }
-                );
-                const liveUrl = new URL(viewerUrl);
-                liveUrl.pathname = liveUrl.pathname.replace(/\/view$/, '/live');
-                // Optimistically suppress the synchronous indicator post
-                // below; if the async send fails we re-post the regular
-                // indicator so the user isn't left looking at nothing.
-                const fallbackPlain = indicator;
-                const fallbackHtml = indicatorHtml;
-                sendLiveOutputEvent(session, {
-                  tool_use_id: liveToolUseId,
-                  command: displayCommand,
-                  viewer_url: liveUrl.toString(),
-                  expires_at: expiresAt,
-                }).then(ok => {
-                  if (ok) return;
-                  if (session.sendHtml && fallbackHtml) {
-                    session.sendHtml(fallbackPlain, fallbackHtml);
-                  } else if (session.sendCallback) {
-                    session.sendCallback(fallbackPlain);
-                  }
+              // Live output rides the journal protocol: one pump per running
+              // command tails the tee log and feeds stream_append ephemerals
+              // (spec §9). Same skip-if-no-session-id rule as journalActivity:
+              // ephemerals replayed late would be stale, so a session whose
+              // claudeSessionId isn't known yet just doesn't stream.
+              if (JOURNAL_ENABLED && session.claudeSessionId) {
+                const pump = createToolStreamPump({
+                  logPath: liveLogPath,
+                  convoId: session.claudeSessionId,
+                  messageRef: liveToolUseId,
+                  meta: { tool: 'Bash', command: displayCommand },
+                  streamAppend: (c, r, off, chunk, meta) =>
+                    journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
-                liveOutputSent = true;
+                toolStreamPumps.set(toolStreamKey(session.claudeSessionId, liveToolUseId), {
+                  pump,
+                  session,
+                  command: displayCommand,
+                  logPath: liveLogPath,
+                  messageRef: liveToolUseId,
+                });
+                pump.start();
               }
+              // Optimistically suppress the synchronous indicator post below;
+              // if the async send fails we re-post the regular indicator so
+              // the user isn't left looking at nothing.
+              const fallbackPlain = indicator;
+              const fallbackHtml = indicatorHtml;
+              sendLiveOutputEvent(session, {
+                tool_use_id: liveToolUseId,
+                command: displayCommand,
+              }).then(ok => {
+                if (ok) return;
+                if (session.sendHtml && fallbackHtml) {
+                  session.sendHtml(fallbackPlain, fallbackHtml);
+                } else if (session.sendCallback) {
+                  session.sendCallback(fallbackPlain);
+                }
+              });
+              liveOutputSent = true;
             }
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
@@ -3178,32 +3199,27 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
   }
 }
 
-async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
-  journalPublish(session, 'publishToolOutput', { tool_use_id, command, viewer_url, expires_at });
-  // 'tool' activity, detail = the command — the seam the brief calls out
-  // (this function is the one place index.js knows the command string at
-  // tool-start time). Trimmed tighter than the server's own 200-char cap.
+async function sendLiveOutputEvent(session, { tool_use_id, command }) {
+  // 'tool' activity, detail = the command — this is the one place index.js
+  // knows the command string at tool-start time. The DURABLE tool_output
+  // journal event is now published at COMPLETION (stopAndFinalizeToolStream),
+  // not here: live viewers get the command from the stream meta frames, and
+  // history gets it from the finalize payload (spec §5.3). No viewer_url /
+  // expires_at anywhere — live output rides the journal protocol.
   journalActivity(session, 'tool', truncateActivityDetail(command));
-  // Sent as a regular m.room.message with a custom content key:
-  // - matron-web-aware clients pick up `chat.matron.live_output` and render
-  //   the live viewer tile.
-  // - Every other Matrix client just shows the body/formatted_body which
-  //   already contains the command and a link to view live output. That
-  //   makes the regular `🔧 <command>` indicator redundant, so the caller
-  //   in the assistant-event handler skips it when this event is sent.
-  // Match the truncation/icon style of the regular `🔧 <cmd>` indicator so
-  // clients that can't render the custom event (most mobile clients) still
-  // get a tight, readable fallback instead of a full untruncated command
-  // and a viewer URL they can't follow.
+  // Matrix room UX: the same custom event as before minus the viewer link.
+  // matron-web's live tile goes dark for new commands until it implements
+  // the journal client contract (accepted, spec §10) — every other Matrix
+  // client keeps rendering the body/formatted_body fallback below.
   const truncated = command.length > 100 ? command.slice(0, 100) + '…' : command;
   const body = `🔧 \`${truncated}\``;
-  const formatted_body = `🔧 <a href="${escapeHtml(viewer_url)}"><code>${escapeHtml(truncated)}</code></a>`;
+  const formatted_body = `🔧 <code>${escapeHtml(truncated)}</code>`;
   const content = {
     msgtype: 'm.text',
     body,
     format: 'org.matrix.custom.html',
     formatted_body,
-    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command, viewer_url, expires_at },
+    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command },
   };
   try {
     await client.sendMessage(session.roomId, content);
