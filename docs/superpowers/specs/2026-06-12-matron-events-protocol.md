@@ -15,7 +15,7 @@ iOS/Mac (Phase 5) and Matron X consume natively:
 |---|---|---|
 | `chat.matron.buttons` | bridge → client | Content key on an ordinary `m.room.message` (`msgtype: m.text`, plaintext fallback in `body`): `{ mode: "pick_one"\|"pick_many", prompt, buttons: [{id, label, value}] }` |
 | `chat.matron.button_response` | client → bridge | Content key `{ selected_values: [String] }` + `m.relates_to: { rel_type: "chat.matron.button_answer", event_id: <buttons event> }`; `body` carries the values joined with `", "` as fallback |
-| `chat.matron.live_output` | bridge → client | Existing live-output viewer-link event (see 2026-05-13 spec) |
+| `chat.matron.live_output` | bridge → client | Bash tool-start event `{tool_use_id, command}`; `viewer_url`/`expires_at` removed 2026-07 — live output now streams over the journal protocol |
 
 Canonical constants: matron-web `src/matron/EventTypes.ts`. Any change
 here must stay byte-compatible with that file.
