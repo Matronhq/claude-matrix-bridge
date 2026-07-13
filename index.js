@@ -3246,7 +3246,9 @@ const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet fr
 
 function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied = false, truncated = false } = {}) {
   if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
-  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  // Capture convoId immediately; session.claudeSessionId is mutable and can be nulled/reassigned across the await gap below.
+  const convoId = session.claudeSessionId;
+  const key = toolStreamKey(convoId, toolUseId);
   const entry = toolStreamPumps.get(key);
   if (!entry) return; // not a streamed command, or already finalized
   toolStreamPumps.delete(key);
@@ -3278,7 +3280,7 @@ function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied
         ? logBuf.subarray(Math.max(0, logBuf.length - TOOL_SNIPPET_READ_BYTES))
         : null;
       const text = tail ? decodeByteExact(tail).text : '';
-      journalPublisher.finalizeToolOutput(session.claudeSessionId, toolUseId, {
+      journalPublisher.finalizeToolOutput(convoId, toolUseId, {
         message_ref: toolUseId,
         command: entry.command,
         exit_code: exitCode,
