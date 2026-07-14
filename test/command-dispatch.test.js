@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   BRIDGE_COMMAND_NAMES,
   classifyBridgeCommand,
+  classifyPrintRescue,
   classifyRescueKeystroke,
   classifyBusyMagicWord,
   isPlanBuildText,
@@ -484,5 +485,65 @@ describe('classifyJournalControlCommand', () => {
     expect(classifyJournalControlCommand('gibberish', { unavailableCommands })).toEqual({ kind: 'help' });
     // And with the real (empty) default denylist, nothing is denied today.
     expect(classifyJournalControlCommand('/sessions')).toEqual({ kind: 'dispatch', cmd: 'sessions', normalizedText: '!sessions' });
+  });
+});
+
+describe('classifyPrintRescue', () => {
+  it('maps !esc and !escape to interrupt', () => {
+    expect(classifyPrintRescue('!esc')).toBe('interrupt');
+    expect(classifyPrintRescue('!escape')).toBe('interrupt');
+    expect(classifyPrintRescue('  !ESC  ')).toBe('interrupt');
+  });
+
+  it('excludes !stop (print mode keeps its stop-session meaning) and !enter', () => {
+    expect(classifyPrintRescue('!stop')).toBeNull();
+    expect(classifyPrintRescue('!enter')).toBeNull();
+  });
+
+  it('ignores bare words, other text, and non-strings', () => {
+    expect(classifyPrintRescue('esc')).toBeNull();
+    expect(classifyPrintRescue('please !esc')).toBeNull();
+    expect(classifyPrintRescue(null)).toBeNull();
+    expect(classifyPrintRescue(42)).toBeNull();
+  });
+});
+
+describe('dispatchJournalRescueKeystroke print path', () => {
+  const mk = () => ({
+    flushCursor: vi.fn(),
+    sendRescueKeystroke: vi.fn(),
+    sendPrintInterrupt: vi.fn(),
+  });
+
+  it('dispatches !esc to sendPrintInterrupt when print-active and not iv-active', async () => {
+    const cb = mk();
+    const handled = await dispatchJournalRescueKeystroke('!esc', false, { ...cb, printActive: true });
+    expect(handled).toBe(true);
+    expect(cb.flushCursor).toHaveBeenCalledTimes(1);
+    expect(cb.sendPrintInterrupt).toHaveBeenCalledTimes(1);
+    expect(cb.sendRescueKeystroke).not.toHaveBeenCalled();
+  });
+
+  it('does NOT treat !stop or !enter as a print interrupt', async () => {
+    const cb = mk();
+    expect(await dispatchJournalRescueKeystroke('!stop', false, { ...cb, printActive: true })).toBe(false);
+    expect(await dispatchJournalRescueKeystroke('!enter', false, { ...cb, printActive: true })).toBe(false);
+    expect(cb.sendPrintInterrupt).not.toHaveBeenCalled();
+    expect(cb.flushCursor).not.toHaveBeenCalled();
+  });
+
+  it('iv-active takes precedence over the print path', async () => {
+    const cb = mk();
+    const handled = await dispatchJournalRescueKeystroke('!esc', true, { ...cb, printActive: true });
+    expect(handled).toBe(true);
+    expect(cb.sendRescueKeystroke).toHaveBeenCalledWith('esc');
+    expect(cb.sendPrintInterrupt).not.toHaveBeenCalled();
+  });
+
+  it('returns false without printActive or without sendPrintInterrupt', async () => {
+    const cb = mk();
+    expect(await dispatchJournalRescueKeystroke('!esc', false, { ...cb })).toBe(false);
+    expect(await dispatchJournalRescueKeystroke('!esc', false, { flushCursor: cb.flushCursor, sendRescueKeystroke: cb.sendRescueKeystroke, printActive: true })).toBe(false);
+    expect(cb.flushCursor).not.toHaveBeenCalled();
   });
 });
