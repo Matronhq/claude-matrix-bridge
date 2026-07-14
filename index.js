@@ -3248,16 +3248,19 @@ async function sendLiveOutputEvent(session, { tool_use_id, command }) {
   }
 }
 
-// Completion seam for a journal-streamed Bash command: stop the pump, read
-// the full tee log, upload it as a media blob (tail-capped), and publish the
-// durable tool_output completion (spec §5.3) whose payload.message_ref
-// retires the live overlay on viewing clients and frees the server-side
-// buffer. Called from the tool_result handler (normal end, denied included)
-// and killSession (exit_code: null) — every stream ends in exactly one
-// finalize; a second call for the same ref is a no-op (the registry entry is
-// gone). Fire-and-forget async: the upload is HTTP, and journal problems
-// must never touch the Matrix hot path (uploadMedia and finalizeToolOutput
-// both already fail open).
+// Completion seam for a journal-streamed Bash command: stop the pump, flush
+// whatever it hasn't caught up to yet, read only the tee log's TAIL via a
+// positioned read (never the whole file — see finalizeToolStreamEntry),
+// upload that tail as a media blob (with a truncation marker line prepended
+// when the read was actually capped), and publish the durable tool_output
+// completion (spec §5.3) whose payload.message_ref retires the live overlay
+// on viewing clients and frees the server-side buffer. Called from the
+// tool_result handler (normal end, denied included) and killSession
+// (exit_code: null) — every stream ends in exactly one finalize; a second
+// call for the same ref is a no-op (the registry entry is gone).
+// Fire-and-forget async: the upload is HTTP, and journal problems must never
+// touch the Matrix hot path (uploadMedia and finalizeToolOutput both already
+// fail open).
 const TOOL_LOG_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // well under the server's 50 MB media cap
 const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet from
 
@@ -3282,19 +3285,50 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
       // is what guarantees flush-then-finalize. flushFinal never throws.
       await entry.pump.flushFinal();
 
+      // Positioned tail read: stat first, then read only the last
+      // min(size, TOOL_LOG_UPLOAD_MAX_BYTES) bytes at that offset, instead
+      // of reading the whole log into heap just to keep the last 10 MiB — a
+      // multi-GB log would otherwise be read fully every time a command
+      // finishes. `logSize` is the true on-disk size (needed below to know
+      // whether this tail read was actually capped).
       let logBuf = null;
+      let logSize = 0;
       try {
-        logBuf = await fs.promises.readFile(entry.logPath);
+        const st = await fs.promises.stat(entry.logPath);
+        logSize = st.size;
+        const readLen = Math.min(st.size, TOOL_LOG_UPLOAD_MAX_BYTES);
+        if (readLen > 0) {
+          const handle = await fs.promises.open(entry.logPath, 'r');
+          try {
+            const buf = Buffer.alloc(readLen);
+            const { bytesRead } = await handle.read(buf, 0, readLen, st.size - readLen);
+            logBuf = bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
+          } finally {
+            await handle.close();
+          }
+        } else {
+          logBuf = Buffer.alloc(0);
+        }
       } catch { /* denied / tee disabled at spawn: no log file — finalize anyway */ }
       let blobRef = null;
       if (logBuf && logBuf.length > 0) {
-        // Tail-cap the upload: the end of a long log (the failure, the
-        // summary) is worth more than its head.
-        const capped = logBuf.length > TOOL_LOG_UPLOAD_MAX_BYTES
-          ? logBuf.subarray(logBuf.length - TOOL_LOG_UPLOAD_MAX_BYTES)
+        // logBuf is already the tail-capped read above: the end of a long
+        // log (the failure, the summary) is worth more than its head. When
+        // the true on-disk size exceeded the cap, prepend a marker line to
+        // the UPLOADED bytes only — never the snippet (derived from logBuf
+        // below, untouched by this), and never opts.truncated in the
+        // payload (that field means something else entirely: matron-tee's
+        // own per-command output cap) — so a blob reader knows it's looking
+        // at a silent tail slice, not the whole log.
+        const wasCapped = logSize > TOOL_LOG_UPLOAD_MAX_BYTES;
+        const uploadBytes = wasCapped
+          ? Buffer.concat([
+              Buffer.from(`[log truncated: showing last ${TOOL_LOG_UPLOAD_MAX_BYTES} of ${logSize} bytes]\n`, 'utf-8'),
+              logBuf,
+            ])
           : logBuf;
         const media = await journalPublisher.uploadMedia({
-          bytes: capped,
+          bytes: uploadBytes,
           contentType: 'text/plain; charset=utf-8',
           name: `tool-output-${toolUseId}.log`,
         });
