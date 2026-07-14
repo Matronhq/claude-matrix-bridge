@@ -1,7 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
-import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCryptoStorageProvider } from 'matrix-bot-sdk';
-import { spawn, execFileSync } from 'child_process';
+import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
@@ -64,9 +63,6 @@ const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user
 
 // --- Config ---
 
-const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
-const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
-
 const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .split(',')
   .map(id => id.trim())
@@ -98,10 +94,7 @@ const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800
 const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
-const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
-const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
-const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
@@ -323,33 +316,6 @@ function debug(...args) {
 
 // --- Session Persistence ---
 
-const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
-
-function loadLastEventTsMap() {
-  try {
-    const raw = fs.readFileSync(LAST_EVENT_TS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    // Migrate from old single-number format
-    if (typeof parsed === 'number') return {};
-    return parsed || {};
-  } catch { return {}; }
-}
-
-let lastEventTsMap = loadLastEventTsMap();
-let lastEventTsDirty = false;
-const botStartupTs = Date.now();
-
-function saveLastEventTsMap() {
-  if (!lastEventTsDirty) return;
-  try {
-    fs.writeFileSync(LAST_EVENT_TS_FILE, JSON.stringify(lastEventTsMap));
-    lastEventTsDirty = false;
-  } catch {}
-}
-
-// Flush per-room timestamps periodically rather than on every event
-setInterval(saveLastEventTsMap, 5000);
-
 function loadPersistedSessions() {
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
@@ -464,14 +430,17 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
-// Fire-and-forget at session creation: read the room's existing m.room.name
-// back into the journal so resumed sessions don't sit titleless (UUID in the
-// journal UI) until the next 5-message Gemini rename. Guards and rationale
-// live in lib/journal-title-seed.js.
+// Fire-and-forget at session creation: seed the journal convo title from a
+// pre-existing name so resumed sessions don't sit titleless (UUID in the
+// journal UI) until the next 5-message Gemini rename. The former source was
+// the Matrix room's m.room.name; with Matrix removed there is no such source,
+// so getRoomName always resolves null and this is a guaranteed no-op today.
+// Kept (rather than deleted) so a future journal-native title source can drop
+// straight in. Guards and rationale live in lib/journal-title-seed.js.
 function journalSeedTitle(session) {
   if (!JOURNAL_ENABLED || !session) return;
   seedJournalTitleFromRoom(session, {
-    getRoomName: async () => (await client.getRoomStateEvent(session.roomId, 'm.room.name', ''))?.name,
+    getRoomName: async () => null,
     upsertConvo: journalUpsertConvo,
     warn: (msg) => console.warn(msg),
   });
@@ -699,8 +668,8 @@ function journalMirrorUserAnswer(session, text) {
   journalPublishUserItem(session, 'publishText', { body, from: 'user' });
 }
 
-// Mirror a Matrix media upload the user just sent into the journal, once it
-// has been downloaded and materialized locally (see buildMediaContentBlocks).
+// Mirror a media upload the user just sent into the journal, once it has been
+// downloaded and materialized locally.
 // Best-effort and fire-and-forget: the HTTP media upload is awaited inside
 // this async IIFE, but the call site never awaits journalMirrorUserMedia
 // itself, so a slow or dead journal server never delays the Matrix/Claude
@@ -873,7 +842,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
-    pendingWelcome: true,    // whether to send welcome on user join
   };
 
   // Parse newline-delimited JSON from stdout
@@ -1131,7 +1099,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     chatHistory: [],
     pinnedSummaryEventId: null,
     pinnedSummaryText: '',
-    pendingWelcome: true,
     pendingInteractivePrompt: null,
   };
 
@@ -1170,11 +1137,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
-      }
     }
     handleInteractivePrompt(session, prompt);
   });
@@ -1293,11 +1255,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         clearTimeout(session._operatorCompactTimer);
         session._operatorCompactTimer = null;
       }
-    }
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
     }
     // Flush any queued messages now that claude is free.
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
@@ -1488,8 +1445,6 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     const html = `<i>→ Sent <b>${escapeHtml(numberPrefix + label)}</b> to Claude${escapeHtml(tail)}</i>`;
     if (session.sendHtml) session.sendHtml(plain, html);
     else if (session.sendCallback) session.sendCallback(plain);
-    if (session.typingInterval) clearInterval(session.typingInterval);
-    session.typingInterval = startTyping(session.roomId);
   };
 
   // Select the free-text slot ("Tell Claude what to change" / "Type something"),
@@ -1700,12 +1655,6 @@ function handleInteractiveScreenUpdate(session, update) {
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
   }
-  // Cancel typing — the user now has something to act on.
-  if (session.typingInterval) {
-    clearInterval(session.typingInterval);
-    session.typingInterval = null;
-    client.setTyping(session.roomId, false, 1000).catch(() => {});
-  }
   // Auto-press Enter for pure acknowledgment cues ("Press Enter to
   // continue…" after /login success, "Press Enter to dismiss" notices,
   // etc). These are just waiting for any keystroke before claude moves
@@ -1759,11 +1708,6 @@ function handleUnclassifiedPrompt(session, { screen }) {
   // busy so the reply is typed into the PTY instead of dropping into the queue.
   if (session.busy) {
     session.busy = false;
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
-    }
   }
 }
 
@@ -1950,9 +1894,6 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     debug('Sending answer to stdin:', jsonMsg.trim());
     session.proc.stdin.write(jsonMsg);
     if (session.resetTimeout) session.resetTimeout();
-
-    if (session.typingInterval) clearInterval(session.typingInterval);
-    session.typingInterval = startTyping(session.roomId);
   }
 }
 
@@ -2258,11 +2199,6 @@ function handleClaudeEvent(session, event) {
           const parsed = parseAskUserQuestion(input);
           if (!parsed.questions.length || !parsed.questions[0].question) continue;
 
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-          }
-
           session.responseBuffer = '';
 
           session.waitingForAnswer = 'text-reply';
@@ -2453,11 +2389,6 @@ function handleClaudeEvent(session, event) {
           // without our normal result-handling path running.
           session.busy = false;
           clearPendingInterrupt(session);
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-            client.setTyping(session.roomId, false, 1000).catch(() => {});
-          }
           break;
         }
       }
@@ -2529,11 +2460,6 @@ function handleClaudeEvent(session, event) {
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
-      }
 
       // Check for ExitPlanMode permission denial — present Build prompt
       const denials = event.permission_denials || [];
@@ -2829,7 +2755,7 @@ function flushResponse(session) {
   if (!text) return;
 
   // /context reports get trimmed to their Model/Tokens headline — the full
-  // table dump is noise on a phone-sized client. /context-full (rewritten to
+  // table dump is noise on a phone-sized screen. /context-full (rewritten to
   // /context in sendToSession) arms a one-shot escape hatch, consumed by the
   // NEXT flush whether or not it turned out to be a report: a /context-full
   // whose report never arrived (error, interrupt) must not leave the flag
@@ -2914,9 +2840,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
   }
 
-  if (session.typingInterval) clearInterval(session.typingInterval);
-  session.typingInterval = startTyping(session.roomId);
-
   // /context-full is a bridge-only command — claude itself knows only
   // /context. Rewrite it here, the single choke point every transport
   // funnels through (Matrix messages, journal-routed text, queue flushes),
@@ -2952,11 +2875,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     // leave the session in `busy=true` with a stuck typing indicator —
     // no claude turn means no Stop hook to clear them.
     session.busy = false;
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
-    }
     // Tell the user what happened directly. Returning true so the caller's
     // generic "Session is not available" fallback doesn't fire — the
     // session IS alive, we just can't forward non-text content through the
@@ -3037,11 +2955,6 @@ function startResumeReadyWatcher(session) {
       // send itself failed) — don't leave a typing indicator spinning with
       // no turn behind it.
       session.busy = false;
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
-      }
     }
   };
 
@@ -3370,63 +3283,7 @@ function deduplicateFilename(dir, filename) {
   return target;
 }
 
-// --- Matrix Typing Indicator ---
-
-function startTyping(roomId) {
-  const send = () => client.setTyping(roomId, true, 30000).catch(() => {});
-  send();
-  // Refresh every 25s (Matrix typing expires after timeout)
-  return setInterval(send, 25000);
-}
-
-function readSidecarToken() {
-  try {
-    return fs.readFileSync(path.join(os.homedir(), '.claude-matrix-bot-crypto', 'access-token'), 'utf-8').trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-// --- Matrix Client ---
-
-const CRYPTO_DIR = path.join(os.homedir(), '.claude-matrix-bot-crypto');
-const TOKEN_SIDECAR = path.join(CRYPTO_DIR, 'access-token');
-
-// Resolve the access token. Sidecar (written by first-start bootstrap)
-// takes precedence over MATRIX_ACCESS_TOKEN from .env, so re-renders
-// of .env (e.g. dev-boxer setup re-runs) can't overwrite a token the
-// bridge minted itself.
-let resolvedAccessToken = readSidecarToken() || MATRIX_ACCESS_TOKEN;
-
-if (!resolvedAccessToken && process.env.MATRIX_BOT_USER_ID && process.env.MATRIX_BOT_PASSWORD && process.env.MATRIX_BOT_RECOVERY_KEY) {
-  console.log('First-start bootstrap: minting access token from imported bot creds');
-  const out = execFileSync(process.execPath, [path.join(__dirname, 'bootstrap-from-creds.mjs')], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    env: process.env,
-  }).toString();
-  const match = out.match(/^access_token=(.+)$/m);
-  if (!match) {
-    console.error('Bootstrap did not return an access token. Output was:\n' + out);
-    process.exit(1);
-  }
-  resolvedAccessToken = match[1].trim();
-  fs.mkdirSync(CRYPTO_DIR, { recursive: true });
-  fs.writeFileSync(TOKEN_SIDECAR, resolvedAccessToken, { mode: 0o600 });
-}
-
-if (!resolvedAccessToken) {
-  console.error('MATRIX_ACCESS_TOKEN is required (set directly, or supply MATRIX_BOT_USER_ID + MATRIX_BOT_PASSWORD + MATRIX_BOT_RECOVERY_KEY for first-start bootstrap)');
-  process.exit(1);
-}
-
-const storage = new SimpleFsStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-state.json'));
-const cryptoStorage = new RustSdkCryptoStorageProvider(CRYPTO_DIR);
-const client = new MatrixClient(MATRIX_HOMESERVER_URL, resolvedAccessToken, storage, cryptoStorage);
-AutojoinRoomsMixin.setupOnClient(client);
-
-let botUserId;
-
-// --- Send to Matrix Room ---
+// --- Send to Session ---
 
 // skipJournalMirror: set by the journal input consumer's Matrix echoes
 // (e.g. "📱 dan (Matron): <body>") and resolved-answer notices — those exist
@@ -3628,47 +3485,11 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 
 // --- Room Management ---
 
-const MATRON_COMMANDS = [
-  { command: 'start', args: '[workdir]', description: 'Start a new session' },
-  { command: 'stop', description: 'Stop the current session' },
-  { command: 'restart', description: 'Stop and immediately resume' },
-  { command: 'resume', args: '<n|id>', description: 'Resume a past session' },
-  { command: 'sessions', description: 'List past sessions' },
-  { command: 'workdir', args: '<path>', description: 'Start in a specific directory' },
-  { command: 'status', description: 'Show session info' },
-  { command: 'working', description: 'Toggle tool call visibility' },
-  { command: 'mcp', description: 'Show MCP server status' },
-  { command: 'model', description: 'Show current model' },
-  { command: 'effort', args: '[level]', description: 'Show or set effort level' },
-  { command: 'cost', description: 'Show session cost' },
-  { command: 'usage', description: 'Show token usage' },
-  { command: 'limits', description: 'Show subscription usage limits' },
-  { command: 'tools', description: 'List available tools' },
-  { command: 'help', description: 'Show all commands' },
-];
-
-async function createSessionRoom(inviteUserId) {
-  const initialState = [
-    ...(ENCRYPT_SESSION_ROOMS ? [{
-      type: 'm.room.encryption',
-      state_key: '',
-      content: { algorithm: 'm.megolm.v1.aes-sha2' },
-    }] : []),
-    ...COMMAND_EVENT_TYPES.map(type => ({
-      type,
-      state_key: '',
-      content: { commands: MATRON_COMMANDS },
-    })),
-  ];
-
-  const roomId = await client.createRoom({
-    preset: 'private_chat',
-    name: `${SERVER_LABEL}: New session`,
-    invite: [inviteUserId],
-    initial_state: initialState,
-  });
-  debug(`Created session room ${roomId} for ${inviteUserId}`);
-  return roomId;
+// Mint a globally-unique conversation id for a new session. Journal convention
+// is a UUID (see matron-journal protocol.md: bridges MUST mint globally-unique
+// convo ids). This id doubles as the in-memory session key (formerly the Matrix room id).
+function newSessionConvoId() {
+  return randomUUID();
 }
 
 async function updateRoomName(roomId, name) {
@@ -3805,98 +3626,6 @@ function hasToolResultInHistory(sessionId, workdir, toolUseId) {
   return false;
 }
 
-// --- Media Handling ---
-
-// TODO(Task4): buildMediaContentBlocks has no non-Matrix caller left after
-// this task's edits — both call sites (in the client.on('room.message')
-// handler) live inside the doomed Matrix inbound handler that Task 4
-// deletes. The Matrix-shaped byte source (downloadMatrixFile, mxcUrl,
-// content.url/content.file, E2E-decrypt) was removed here in Task 3 along
-// with outbound Matrix sends; nothing yet supplies `buffer` for a
-// journal-only inbound-media path. Left as a guarded no-op (returns no
-// blocks) rather than guessing the replacement byte source — Task 4 must
-// either wire a journal-sourced buffer here or remove this function
-// outright.
-async function buildMediaContentBlocks(event, session) {
-  const blocks = [];
-  const content = event.content;
-
-  const buffer = null;
-  if (!buffer) return blocks;
-  // fileName is used as a path segment for workdir saves below — basename()
-  // strips directory components a malicious/odd Matrix body might carry
-  // (mirrors resolveUploadMeta in lib/iv-uploads.js; '.'/'..' survive
-  // basename, so fold them into the fallback).
-  const rawFileName = path.basename(content.body || 'file');
-  const fileName = rawFileName === '' || rawFileName === '.' || rawFileName === '..' ? 'file' : rawFileName;
-  const mime = content.info?.mimetype || 'application/octet-stream';
-  // Matrix image events commonly carry width/height in `info` — cheap to
-  // reuse for the journal's optional image dims, no image lib needed.
-  const dims = (Number.isFinite(content.info?.w) && Number.isFinite(content.info?.h))
-    ? { w: content.info.w, h: content.info.h }
-    : undefined;
-
-  if (content.msgtype === 'm.audio') {
-    const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
-    blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
-  } else if (session.iv) {
-    // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
-    // only an absolute-path annotation; Claude reads it with its Read tool.
-    // No base64 blocks and no inline content dump (SDK mode keeps those).
-    const { filename, caption } = resolveUploadMeta(content);
-    const dir = ivUploadDir(session.roomId);
-    const savePath = deduplicateFilename(dir, filename);
-    fs.writeFileSync(savePath, buffer);
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
-    // Journal mirror (upload + publish + markRead) is deferred to actual
-    // dispatch time — see lib/media-mirror.js. Attaching it here (rather
-    // than calling journalMirrorUserMedia now) is what stops a queued
-    // attachment that later gets cancelled from leaving a phantom journal
-    // entry / advanced read marker for something Claude never saw.
-    attachPendingMediaMirror(blocks, { buffer, mime, name: filename, dims });
-    return blocks; // caption already folded in; skip the SDK caption append below
-  } else if (content.msgtype === 'm.image') {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, fileName);
-    fs.writeFileSync(imgPath, buffer);
-    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
-    blocks.push({
-      type: 'image',
-      source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-    });
-    attachPendingMediaMirror(blocks, { buffer, mime, name: fileName, dims });
-  } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, fileName);
-    fs.writeFileSync(savePath, buffer);
-    blocks.push({ type: 'text', text: `File saved to ${savePath}` });
-    attachPendingMediaMirror(blocks, { buffer, mime, name: fileName, dims });
-
-    if (mime === 'application/pdf') {
-      blocks.push({
-        type: 'document',
-        source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
-      });
-    } else if (mime.startsWith('image/')) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-      });
-    } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
-      blocks.push({ type: 'text', text: `Contents of ${fileName}:\n${buffer.toString('utf-8')}` });
-    } else {
-      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
-    }
-  }
-
-  // Caption: for m.file events, the filename differs from body when there's a caption
-  if (content.msgtype === 'm.file' && content.filename !== content.body) {
-    blocks.push({ type: 'text', text: content.body });
-  }
-
-  return blocks;
-}
-
 // --- Command Handler ---
 
 // Run `claude -p "/usage"` as a one-shot and return its stdout. stdin is
@@ -3966,15 +3695,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         workdir = resolved;
       }
 
-      // Create a new room for this session
-      let sessionRoomId;
-      try {
-        sessionRoomId = await createSessionRoom(sender);
-      } catch (e) {
-        console.error('Failed to create session room:', e);
-        await sendReply(`Failed to create session room: ${e.message}`);
-        return;
-      }
+      // Mint a fresh conversation id for this session
+      const sessionRoomId = newSessionConvoId();
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -3999,8 +3721,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
       await sendReply(`Session started in a new conversation${extrasNote}.`);
-
-      // Welcome message will be sent when user joins (see room.join handler)
       break;
     }
 
@@ -4013,14 +3733,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       killSession(session);
       sessions.delete(roomId);
       journalEvictConvoInput(session);
-      // Append [done] to the session room name
-      try {
-        const nameEvent = await client.getRoomStateEvent(session.roomId, 'm.room.name', '');
-        const currentName = nameEvent?.name || '';
-        if (currentName && !currentName.endsWith('[done]')) {
-          updateRoomName(session.roomId, `${currentName} [done]`);
-        }
-      } catch { /* room name not set */ }
       await sendReply('Session stopped.');
       break;
     }
@@ -4131,15 +3843,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
       }
 
-      // Create a new room for the resumed session
-      let sessionRoomId;
-      try {
-        sessionRoomId = await createSessionRoom(sender);
-      } catch (e) {
-        console.error('Failed to create session room:', e);
-        await sendReply(`Failed to create session room: ${e.message}`);
-        return;
-      }
+      // Mint a fresh conversation id for the resumed session
+      const sessionRoomId = newSessionConvoId();
 
       const shortId = resumeSessionId.slice(0, 8);
       const summary = await getSessionSummary(resumeSessionId, actualWorkdir);
@@ -4212,15 +3917,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      // Create a new room for this session
-      let sessionRoomId;
-      try {
-        sessionRoomId = await createSessionRoom(sender);
-      } catch (e) {
-        console.error('Failed to create session room:', e);
-        await sendReply(`Failed to create session room: ${e.message}`);
-        return;
-      }
+      // Mint a fresh conversation id for this session
+      const sessionRoomId = newSessionConvoId();
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -4386,7 +4084,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/limits — Show subscription usage limits (session & weekly)\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
-        `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
+        `Each /start, /resume, and /workdir creates a new session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
@@ -4426,7 +4124,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
+        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
@@ -4914,11 +4612,6 @@ async function journalRouteTextToSession(session, body) {
         session.pendingUnclassifiedPrompt = false;
         if (session.busy) {
           session.busy = false;
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-            client.setTyping(session.roomId, false, 1000).catch(() => {});
-          }
         }
         ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
@@ -5140,8 +4833,8 @@ function journalIsControlConvo(convoId) {
 // `!opaque:server`). handleCommand's own `sessions.get(roomId)` naturally
 // resolves to undefined for that synthetic ID, which reproduces exactly the
 // behavior a fresh, session-less Matrix room already has: /start, /resume,
-// and /workdir create a brand new session + room (same
-// createSessionRoom/createSession primitives, same argument handling
+// and /workdir create a brand new session (same
+// newSessionConvoId/createSession primitives, same argument handling
 // including default workdir and --browser extras); every session-scoped
 // command (/status, /stop, /mcp, /model, …) correctly reports "No active
 // session" rather than doing something wrong; /limits (not session-scoped)
@@ -5346,8 +5039,6 @@ async function approvePlanBuild(session, { sendHtml }) {
     console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
     session.proc.stdin.write(jsonMsg);
     if (session.resetTimeout) session.resetTimeout();
-    if (session.typingInterval) clearInterval(session.typingInterval);
-    session.typingInterval = startTyping(session.roomId);
   }
   const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
   await sendHtml(buildNotice.plain, buildNotice.html);
@@ -5389,556 +5080,6 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   enterResumeHold(newSession);
   return newSession;
 }
-
-// --- Matrix Message Handler ---
-
-client.on('room.message', async (roomId, event) => {
-  try {
-  // Ignore own messages
-  if (event.sender === botUserId) return;
-  // Ignore non-message events and edits
-  if (!event.content?.msgtype) return;
-  if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
-
-  // Skip events we already processed before a restart (per-room tracking).
-  // Only apply dedup for events that predate bot startup — these are sync replays.
-  // Events newer than startup can't be replays and are always processed, even if
-  // federated clock skew makes their timestamp slightly out of order.
-  const eventTs = event.origin_server_ts || 0;
-  const roomLastTs = lastEventTsMap[roomId] || 0;
-  if (eventTs < botStartupTs && eventTs <= roomLastTs) {
-    debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${roomLastTs})`);
-    return;
-  }
-  if (eventTs > roomLastTs) {
-    lastEventTsMap[roomId] = eventTs;
-    lastEventTsDirty = true;
-  }
-
-  const sender = event.sender;
-  if (warnIfDisallowed(sender, roomId)) return;
-
-  const msgtype = event.content.msgtype;
-  let text = '';
-  let hasMedia = false;
-
-  if (msgtype === 'm.text' || msgtype === 'm.notice') {
-    text = (event.content.body || '').trim();
-  } else if (msgtype === 'm.image' || msgtype === 'm.file' || msgtype === 'm.audio') {
-    hasMedia = true;
-    text = (event.content.body || '').trim();
-  }
-
-  if (!text && !hasMedia) return;
-
-  console.log(
-    `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
-  );
-
-  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
-  const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
-
-  // Bridge commands use / or ! prefix. Classification is shared with the
-  // journal session-text route (lib/command-dispatch.js, see
-  // journalRouteTextToSession) so the two transports can't silently
-  // diverge on which commands get intercepted.
-  if (text.startsWith('!') || text.startsWith('/')) {
-    const normalizedText = classifyBridgeCommand(text);
-    if (normalizedText) {
-      await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
-      return;
-    }
-    // Fall through — forward to Claude Code session
-  }
-
-  // Forward to Claude Code session
-  let session = sessions.get(roomId);
-  if (!session || !session.alive) {
-    // Auto-resume if this room has a persisted session (session-specific room)
-    const prev = getPersistedSession(roomId);
-    if (prev && prev.sessionId) {
-      // Clean up dead session if present
-      if (session) sessions.delete(roomId);
-      session = resumePersistedSession(roomId, prev);
-    } else {
-      // Auto-start a session in this room
-      const workdir = DEFAULT_WORKDIR;
-      const newSession = createSession(roomId, workdir);
-      newSession.sendCallback = sendReply;
-      newSession.sendHtml = sendHtmlFn;
-      // Wire the button channel like every other session-creation path (the
-      // auto-resume branch above, /start, /resume) so button-based features
-      // (/model picker, AskUserQuestion, queue actions) work in auto-started
-      // sessions instead of silently degrading to text-only.
-      newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
-      session = newSession;
-
-      const autoNotice = notice('info',
-        `Session started.\nWorkdir: ${workdir}`,
-        `<b>Session started</b><br/>Workdir: <code>${escapeHtml(workdir)}</code>`);
-      await sendHtmlFn(autoNotice.plain, autoNotice.html);
-    }
-  }
-
-  // iv-mode: route a typed reply to a pending TUI prompt before treating it as
-  // a normal message. If we consumed it as a prompt response, return.
-  //
-  // Skip this for button responses. A prompt surfaced as buttons (prompt-opt:)
-  // is answered by the dedicated dispatch below, not here; and other button
-  // actions (effort:/model:/interrupt/cancel:) are never prompt answers.
-  // Without this guard, tapping an effort/model picker while a TUI prompt is
-  // pending — e.g. the "Change effort level?" confirm raised by a prior effort
-  // tap — hits maybeResolve's unmatched path, which nulls pendingInteractivePrompt
-  // WITHOUT answering the TUI and falls through, so the button value then types
-  // a stray /effort|/model into the still-open menu, desyncing the PTY.
-  const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
-  if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
-    // Answering a classified prompt also retires any stale best-effort
-    // unclassified-prompt gate, so later messages aren't wrongly intercepted.
-    session.pendingUnclassifiedPrompt = false;
-    return;
-  }
-
-  // Reply to a detector-missed menu surfaced via handleUnclassifiedPrompt. A
-  // bare option number/letter is driven into the open TUI selection through
-  // respondToPrompt (sends the digits/letter then a delayed Enter, like a
-  // classified prompt — bracketed-paste sendText wouldn't select). Any OTHER
-  // reply is NOT typed into the menu (that would desync the PTY): we keep the
-  // prompt pending and tell the user how to answer or cancel.
-  // `!`-prefixed rescue commands (!esc/!enter/!stop/…) must pass through to
-  // their handlers below — the unclassified notice tells the user to send !esc
-  // to cancel, so we must not swallow it here.
-  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse
-      && !text.trim().startsWith('!')) {
-    const sel = text.trim();
-    if (/^\d{1,3}$/.test(sel)) {
-      session.pendingUnclassifiedPrompt = false;
-      // Don't reset the detector dedup — the just-answered screen may linger a
-      // moment, and resetting would let it re-emit unclassified-prompt.
-      session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
-      journalMirrorUserAnswer(session, sel);
-      return;
-    }
-    if (/^[a-zA-Z]$/.test(sel)) {
-      session.pendingUnclassifiedPrompt = false;
-      session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
-      journalMirrorUserAnswer(session, sel);
-      return;
-    }
-    const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
-    if (session.sendHtml) session.sendHtml(guide, escapeHtml(guide));
-    else if (session.sendCallback) session.sendCallback(guide);
-    return;
-  }
-
-  // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
-  const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
-  if (buttonResponse) {
-    const selectedValues = (typeof buttonResponse === 'object' && Array.isArray(buttonResponse.selected_values))
-      ? buttonResponse.selected_values
-      : null;
-    // Use structured values if available, fall back to body
-    const value = selectedValues ? selectedValues.join(', ') : (event.content.body || '').trim();
-    // Override body-based text so the answer handler also uses structured values
-    if (selectedValues) text = value;
-
-    // Queue-tile actions (⚡ Send now / ✕ Cancel) — extracted to
-    // lib/busy-queue.js (handleQueueActionValue) so the journal prompt_reply
-    // route runs the SAME implementation: a Matron card tap sends the exact
-    // wire values this branch matches on.
-    if (handleQueueActionValue(value, session, {
-      sendReply: session.sendCallback ? (m) => session.sendCallback(m) : null,
-      sendHtml: session.sendHtml ? (p, h) => session.sendHtml(p, h) : null,
-      formatQueueSummary,
-      flushQueue,
-      stripQueueNotificationLinks,
-      editMessage,
-    })) {
-      return;
-    }
-
-    // Model picker button (no-arg /model) — value is `model:<alias>`.
-    const modelMatch = value.match(/^model:(.+)$/);
-    if (modelMatch) {
-      applyModelSwitch(roomId, session, modelMatch[1], { sendReply, sendHtml: sendHtmlFn });
-      return;
-    }
-
-    // Mode toggle button — value is `mode:interactive` or `mode:print`.
-    const modeMatch = value.match(/^mode:(interactive|print)$/);
-    if (modeMatch) {
-      if (!session || !session.alive) {
-        sendReply('No active session. Start a session first.');
-        return;
-      }
-      const wantInteractive = modeMatch[1] === 'interactive';
-      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml: sendHtmlFn });
-      return;
-    }
-
-    // Effort picker button (no-arg /effort) — value is `effort:<level>`.
-    const effortMatch = value.match(/^effort:(.+)$/);
-    if (effortMatch) {
-      switchEffortInSession(session, effortMatch[1], sendReply);
-      return;
-    }
-
-    // Detected-prompt button — value is `prompt-opt:<index>`. Drive the open
-    // TUI menu via keystrokes (the only correct iv-mode answer channel). The
-    // fix/effort-command guard already skips maybeResolveInteractivePrompt for
-    // button responses, so this won't be mis-consumed as a typed reply.
-    const promptOptMatch = value.match(/^prompt-opt:(\d+)$/);
-    if (promptOptMatch) {
-      const p = session.pendingInteractivePrompt;
-      const optIdx = Number(promptOptMatch[1]);
-      const resp = p ? promptResponseForButton(p, optIdx) : null;
-      if (p && resp && session.iv && session.iv.alive) {
-        session.pendingInteractivePrompt = null;
-        // Answering also retires any stale unclassified-prompt gate.
-        session.pendingUnclassifiedPrompt = false;
-        session.iv.respondToPrompt(resp);
-        // Mirror the human-readable choice (the tapped option's label; the
-        // raw prompt-opt:<n> value is a fallback that shouldn't happen —
-        // promptButtons refuses to build buttons for unlabeled options).
-        journalMirrorUserAnswer(session, (p.options?.[optIdx]?.label || '').trim() || value);
-      }
-      return;
-    }
-
-    // Otherwise treat as a question answer — fall through to waitingForAnswer handling
-    // The value is already the button label, so resolveQuestionAnswer will use it as-is
-  }
-
-  // If Claude Code asked a question, handle the answer
-  if (session.waitingForAnswer) {
-    const q = session.pendingQuestions?.[0];
-    if (q?.options?.length > 0) {
-      const answer = resolveQuestionAnswer(session, text);
-      const header = q.header ? `${q.header}: ` : '';
-      submitAnswer(session, `${header}${answer}`);
-    } else {
-      submitAnswer(session, text);
-    }
-    return;
-  }
-
-  // Handle text "build" for plan approval. Decision (exact keyword + the
-  // pending-plan gate) is shared with the journal session-text route via
-  // dispatchPlanBuild (lib/command-dispatch.js); the implementation is the
-  // shared approvePlanBuild below — extracted verbatim from the block that
-  // used to live here, so both transports run the SAME code path.
-  console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  const handledBuild = await dispatchPlanBuild(
-    text,
-    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
-    { approvePlan: () => approvePlanBuild(session, { sendHtml: sendHtmlFn }) },
-  );
-  if (handledBuild) return;
-
-  // User sent feedback on the plan (not "build") — clear plan state and forward as message.
-  // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
-  if ((session.pendingPlan || session.pendingPlanDenialId) && !session.busy) {
-    session.pendingPlan = null;
-    session.pendingPlanDenialId = null;
-    if (session.claudeSessionId) {
-      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-    }
-    // Falls through to normal message handling below
-  }
-
-  // In iv-mode, claude-side slash commands (/login, /mcp, /commit, etc)
-  // are TUI control commands — they belong in claude's input buffer, not
-  // in the bridge's "next user prompt" queue. Bypass the busy/queue path
-  // so they flow straight through to the PTY. Without this, /login
-  // sits in the queue forever if the previous turn's Stop hook didn't
-  // fire (e.g. for unauthenticated "Please run /login" pseudo-turns)
-  // and the user can't recover without manually flushing.
-  const isClaudeSlashCommand = session.iv && isIvSlashPassthrough(text);
-  // Raw-keystroke rescue commands for iv-mode sessions. These work
-  // regardless of busy state because they're pure recovery actions
-  // (the user can always need to interrupt claude or nudge a stuck
-  // input box, even when the bridge thinks claude is mid-turn).
-  //
-  //   !enter — send Enter into the PTY. Use when a heavy session
-  //            resume + race left text sitting unsent in claude's
-  //            input box.
-  //   !esc   — send Esc into the PTY. Same effect as pressing Esc
-  //            in the TUI: cancels the current generation/turn,
-  //            dismisses the OAuth wait, exits a menu, etc.
-  //
-  // Classification is shared with the journal session-text route via
-  // classifyRescueKeystroke (lib/command-dispatch.js) — see
-  // journalRouteTextToSession.
-  if (session.iv && session.iv.alive) {
-    const rescue = classifyRescueKeystroke(text);
-    if (rescue === 'enter') {
-      try {
-        session.iv.sendKeystroke('enter');
-        await sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
-      } catch (err) {
-        await sendReply(`Could not send Enter: ${err.message}`);
-      }
-      return;
-    }
-    if (rescue === 'esc') {
-      try {
-        session.iv.sendKeystroke('esc');
-        // Esc dismisses any open menu, so a best-effort unclassified-prompt is
-        // no longer pending.
-        session.pendingUnclassifiedPrompt = false;
-        // Clear bridge-side busy state since claude won't fire a Stop
-        // hook after a user-cancelled turn — leaving busy=true would
-        // queue every subsequent message.
-        if (session.busy) {
-          session.busy = false;
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-            client.setTyping(session.roomId, false, 1000).catch(() => {});
-          }
-        }
-        await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
-      } catch (err) {
-        await sendReply(`Could not send Esc: ${err.message}`);
-      }
-      return;
-    }
-  } else if (classifyPrintRescue(text)) {
-    // Print-mode counterpart: cancel the current turn via a control_request
-    // on the CLI's stdin. Runs before busy-queueing for the same reason the
-    // iv branch does — interrupting is exactly what you need while busy.
-    // !stop deliberately keeps its stop-session meaning here (handled by the
-    // command dispatch above); !enter stays iv-only.
-    await printModeInterrupt(session, sendReply);
-    return;
-  }
-  if (session.busy && !isClaudeSlashCommand) {
-    // Busy-queue magic words: bare send/interrupt/!interrupt flush the queue
-    // now; bare cancel pops the last queued message. Classification and
-    // implementation are shared with the journal session-text route
-    // (classifyBusyMagicWord in lib/command-dispatch.js +
-    // lib/busy-queue.js) so the two transports can't fork — the Matrix-only
-    // notification edits ride in as the stripQueueNotificationLinks /
-    // editMessage seams, which the journal caller now also passes (its
-    // session.roomId is a real Matrix room) so send/cancel keep the queue
-    // and its notification tiles aligned identically on both transports.
-    const handledMagicWord = await dispatchBusyQueueMagicWord(text, session, {
-      sendReply,
-      sendHtml: sendHtmlFn,
-      formatQueueSummary,
-      flushQueue,
-      stripQueueNotificationLinks,
-      editMessage,
-    });
-    if (handledMagicWord) return;
-    // Queue the message
-    if (!session.queuedMessages) session.queuedMessages = [];
-    if (!session.queueNotifications) session.queueNotifications = [];
-
-    if (hasMedia) {
-      try {
-        const blocks = await buildMediaContentBlocks(event, session);
-        session.queuedMessages.push(blocks);
-      } catch (err) {
-        console.error('Media queue error:', err);
-        await sendReply(`Failed to process file: ${err.message}`);
-        return;
-      }
-    } else {
-      session.queuedMessages.push([{ type: 'text', text }]);
-    }
-    const preview = hasMedia
-      ? (event.content.body || '[media]')
-      : (text.length > 40 ? text.slice(0, 37) + '…' : text);
-    // Shared with the journal session-text route (lib/busy-queue.js) so both
-    // transports post the same tile. buildActionLinks is the Matrix-only
-    // signed-link fallback for button-less sessions (existing behavior).
-    await notifyQueuedMessage(session, preview, {
-      sendReply,
-      sendHtml: sendHtmlFn,
-      htmlEscape: escapeHtml,
-      buildActionLinks: (queueIndex) => {
-        const interruptLink = generateActionLink('interrupt', roomId);
-        const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
-        const links = [];
-        if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
-        if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
-        return links.length ? links.join(' · ') : null;
-      },
-    });
-    return;
-  }
-
-  // Slash-command bypass keeps the queue intact: the command is for claude's
-  // PTY input, not a new turn start, so any messages queued during the
-  // still-running prior turn should still flush when that turn ends.
-  if (!isClaudeSlashCommand) {
-    session.queuedMessages = null;
-  }
-
-  // An operator-typed `/compact` compacts and returns to the idle input box
-  // WITHOUT producing an assistant turn — so no Stop hook fires and the iv
-  // turn-end path (onTurnEnd) never runs to clear `busy`. The session then
-  // wedges in busy=true and every later message drops into the queue. Mark
-  // it here so the matching compact_boundary transcript event can stand in
-  // as the turn-end signal (see case 'system' in handleClaudeEvent). The
-  // flag is operator-scoped on purpose: a model-invoked /compact mid-turn is
-  // also trigger='manual' but DOES continue into a real turn + Stop hook, so
-  // it must not be cleared here. Self-clears after a generous window in case
-  // compaction fails and no boundary event ever arrives.
-  //
-  // Two further guards keep the fallback from clearing busy for the WRONG
-  // turn: (1) only arm when the session is idle now — a /compact typed while
-  // a turn is still running will be cleared by that turn's own Stop hook, so
-  // arming would risk a later boundary clearing busy mid-next-turn; (2) stamp
-  // the current turnCount and only honour the boundary if it hasn't advanced
-  // (a real turn-end in between both increments it and disarms the flag).
-  if (isClaudeSlashCommand && /^\/compact(\s|$)/.test(text.trim()) && !session.busy) {
-    session._operatorCompactPending = true;
-    session._operatorCompactPendingTurn = session.turnCount;
-    if (session._operatorCompactTimer) clearTimeout(session._operatorCompactTimer);
-    session._operatorCompactTimer = setTimeout(() => {
-      session._operatorCompactTimer = null;
-      session._operatorCompactPending = false;
-    }, 300_000);
-    if (typeof session._operatorCompactTimer.unref === 'function') session._operatorCompactTimer.unref();
-  }
-
-  if (hasMedia) {
-    try {
-      // Show transcription status for voice notes
-      let statusEventId = null;
-      if (msgtype === 'm.audio') {
-        const transcribeNotice = notice('info', 'Transcribing voice note...', 'Transcribing voice note…');
-        statusEventId = await sendHtmlFn(transcribeNotice.plain, transcribeNotice.html);
-      }
-
-      const blocks = await buildMediaContentBlocks(event, session);
-      if (blocks.length === 0) {
-        if (statusEventId) await editMessage(roomId, statusEventId, 'Voice note transcription failed', notice('error', 'Voice note transcription failed', 'Voice note transcription failed').html);
-        else await sendReply('Could not process the file.');
-        return;
-      }
-
-      // Update status with transcription preview
-      if (statusEventId && msgtype === 'm.audio') {
-        const transcriptionBlock = blocks.find(b => b.type === 'text' && b.text.startsWith('[Voice note transcription]'));
-        if (transcriptionBlock) {
-          const preview = transcriptionBlock.text.replace('[Voice note transcription]: ', '');
-          const doneNotice = notice('success', `Transcribed: ${preview}`, `Transcribed: ${escapeHtml(preview)}`);
-          await editMessage(roomId, statusEventId, doneNotice.plain, doneNotice.html);
-        }
-      }
-
-      if (!sendToSession(session, blocks)) {
-        await sendReply('Session is not available. Send !start to begin a new one.');
-      } else {
-        // Media journal mirror (upload + publish + markRead) happens here,
-        // at actual dispatch, not at buildMediaContentBlocks build time —
-        // see lib/media-mirror.js (Bugbot finding #4).
-        for (const payload of pendingMediaMirror(blocks)) journalMirrorUserMedia(session, payload);
-        if (!session.firstMessageCaptured) {
-          session.firstMessageCaptured = true;
-          const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-          const fileName = event.content.body || 'file';
-          const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 60)}`;
-          updateRoomName(session.roomId, label);
-        }
-      }
-    } catch (err) {
-      console.error('Media processing error:', err);
-      await sendReply(`Failed to process file: ${err.message}`);
-    }
-  } else {
-    if (!sendTextToSession(session, text)) {
-      await sendReply('Session is not available. Send !start to begin a new one.');
-    } else {
-      // Track user message for topic summarization (full text)
-      if (!session.chatHistory) session.chatHistory = [];
-      session.chatHistory.push({ role: 'user', text: text });
-      debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
-      // Persist chatHistory for resume across restarts
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-      }
-
-      if (!session.firstMessageCaptured) {
-        session.firstMessageCaptured = true;
-        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-
-        // Generate initial 3-word name via Gemini
-        if (genAI) {
-          (async () => {
-            try {
-              const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-              const result = await model.generateContent(
-                `Generate a 3-5 word title (max 34 chars) for a conversation starting with this message.\n\nMessage: ${text.slice(0, 500)}`
-              );
-              const title = result.response.text().trim().slice(0, 60);
-              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
-            } catch (_e) {
-              // Fallback to first message if Gemini fails
-              const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
-              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
-            }
-          })();
-        } else {
-          // No Gemini configured - use first message
-          const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
-          updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
-        }
-      }
-    }
-  }
-  } catch (err) {
-    console.error('[ERROR] room.message handler:', err);
-  }
-});
-
-// --- Room Membership Handler ---
-
-async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
-  const session = sessions.get(roomId);
-  if (!session || !session.pendingWelcome) return;
-  if (joinedUserId === botUserId) return;
-
-  // Mark as sent before sending to avoid duplicate notices if both room.join
-  // and the membership state event arrive.
-  session.pendingWelcome = false;
-
-  // Let the crypto room tracker process the join before sharing the room key.
-  await new Promise(r => setTimeout(r, 500));
-
-  const workdir = session.workdir;
-  const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
-  const welcomeHtml =
-    `<b>Session started</b><br/>` +
-    `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
-    `<i>Send any message to interact with Claude Code.</i>`;
-
-  if (session.sendHtml) {
-    await session.sendHtml(welcomePlain, welcomeHtml);
-  }
-}
-
-client.on('room.join', async (roomId, event) => {
-  try {
-    await sendPendingWelcomeIfNeeded(roomId, event.state_key || event.sender);
-  } catch (err) {
-    console.error('[ERROR] room.join handler:', err);
-  }
-});
-
-client.on('room.event', async (roomId, event) => {
-  try {
-    if (event.type !== 'm.room.member') return;
-    if (event.content?.membership !== 'join') return;
-    await sendPendingWelcomeIfNeeded(roomId, event.state_key || event.sender);
-  } catch (err) {
-    console.error('[ERROR] room.event membership handler:', err);
-  }
-});
 
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
@@ -6144,22 +5285,14 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/redact-message') {
-        const { roomId, eventId, reason } = data;
-        if (!roomId || !eventId) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'roomId and eventId are required' }));
-          return;
-        }
-
-        try {
-          await client.redactEvent(roomId, eventId, reason || 'Message redacted by bridge');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (err) {
-          debug(`Failed to redact message: ${err.message}`);
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: `Failed to redact message: ${err.message}` }));
-        }
+        // Message redaction was a Matrix-only capability (redacting a room
+        // event). The journal transport has no equivalent, so this endpoint
+        // now reports unsupported instead of acting. The ask-user
+        // redact_message MCP tool surfaces this text back to Claude; that MCP
+        // tool lives in ask-user.js (out of scope for this task) and should
+        // be retired in a follow-up.
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Message redaction is not supported: the bridge is journal-only and has no message-redaction capability.' }));
         return;
       }
 
@@ -6521,11 +5654,6 @@ async function printModeInterrupt(session, sendReply) {
       session.pendingInterrupt = null;
       if (!session.busy) return;
       session.busy = false;
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
-      }
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
       Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
@@ -6604,9 +5732,11 @@ async function main() {
     await fs.promises.mkdir(SECRETS_DIR, { mode: 0o700, recursive: true });
   } catch {}
 
-  botUserId = await client.getUserId();
-  console.log(`Bot logged in as ${botUserId}`);
-  console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
+  if (!JOURNAL_WS_URL || !_journalToken) {
+    console.error('JOURNAL_WS_URL and a journal agent token (JOURNAL_TOKEN_FILE or JOURNAL_TOKEN) are required.');
+    process.exit(1);
+  }
+
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
@@ -6615,36 +5745,9 @@ async function main() {
   } else {
     console.log('Session idle timeout: disabled');
   }
-  console.log(`Session room encryption: ${ENCRYPT_SESSION_ROOMS ? 'ON' : 'OFF'}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
-
-  await client.start();
-  console.log('Matrix client started, listening for messages...');
-
-  // Ensure all joined rooms have the Matron command state event (only if changed)
-  try {
-    const rooms = await client.getJoinedRooms();
-    const newCommandsJson = JSON.stringify({ commands: MATRON_COMMANDS });
-    let updated = 0;
-    for (const roomId of rooms) {
-      for (const eventType of COMMAND_EVENT_TYPES) {
-        try {
-          const existing = await client.getRoomStateEvent(roomId, eventType, '');
-          if (JSON.stringify(existing) === newCommandsJson) continue;
-        } catch { /* state event doesn't exist yet */ }
-        try {
-          await client.sendStateEvent(roomId, eventType, '', { commands: MATRON_COMMANDS });
-          updated++;
-        } catch (e) {
-          debug(`Could not set commands state ${eventType} in ${roomId}: ${e.message}`);
-        }
-      }
-    }
-    console.log(`Checked command state events in ${rooms.length} rooms (updated ${updated})`);
-  } catch (e) {
-    console.error('Failed to update command state events:', e.message);
-  }
+  console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);
 }
 
 main().catch(err => {
@@ -6654,19 +5757,15 @@ main().catch(err => {
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
-  saveLastEventTsMap();
   for (const [, session] of sessions) {
     killSession(session);
   }
-  client.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  saveLastEventTsMap();
   for (const [, session] of sessions) {
     killSession(session);
   }
-  client.stop();
   process.exit(0);
 });
