@@ -18,13 +18,15 @@ import {
   JOURNAL_UNAVAILABLE_COMMANDS,
 } from '../lib/command-dispatch.js';
 
-// Matrix regression pins (Deliverable 4): these lock in current behavior for
-// the classifiers the Matrix room.message handler was refactored to use
-// (index.js's bridgeCommandNames gate, the !enter/!esc rescue block, and the
-// isClaudeSlashCommand predicate). If a future edit changes what these
-// return, BOTH transports silently fork at once — that's exactly the
-// failure mode this file exists to catch.
-describe('classifyBridgeCommand (Matrix regression pins)', () => {
+// Journal command-classifier pins (Deliverable 4; formerly "Matrix
+// regression pins" — Matrix's room.message handler was retired in Task 4,
+// so the journal input consumer is now the sole caller of these
+// classifiers). These lock in the classification behavior the journal path
+// depends on (index.js's bridgeCommandNames gate, the !enter/!esc rescue
+// block, and the isClaudeSlashCommand predicate). If a future edit changes
+// what these return, the journal transport silently breaks — that's exactly
+// the failure mode this file exists to catch.
+describe('classifyBridgeCommand (journal command classification pin)', () => {
   it('classifies /stop', () => {
     expect(classifyBridgeCommand('/stop')).toBe('!stop');
   });
@@ -90,7 +92,7 @@ describe('classifyBridgeCommand (Matrix regression pins)', () => {
   });
 });
 
-describe('classifyRescueKeystroke (Matrix regression pin: !esc)', () => {
+describe('classifyRescueKeystroke (journal command classification pin: !esc)', () => {
   it('classifies !esc', () => {
     expect(classifyRescueKeystroke('!esc')).toBe('esc');
   });
@@ -128,10 +130,11 @@ describe('classifyRescueKeystroke (Matrix regression pin: !esc)', () => {
 
 // Busy-queue magic words (PR #101 follow-up). While a session is busy, bare
 // send/interrupt/!interrupt flush the queue and bare cancel pops the last
-// queued message — Matrix behavior pinned here, now shared with the journal
-// session-text route (lib/busy-queue.js). Classification only: the busy
-// gating lives at the call sites (and in dispatchBusyQueueMagicWord).
-describe('classifyBusyMagicWord (Matrix regression pins)', () => {
+// queued message — originally Matrix behavior, now the journal session-text
+// route's own behavior (lib/busy-queue.js) since Matrix was retired in Task
+// 4. Classification only: the busy gating lives at the call sites (and in
+// dispatchBusyQueueMagicWord).
+describe('classifyBusyMagicWord (journal command classification pin)', () => {
   it("classifies the flush words exactly as the Matrix busy branch compared them", () => {
     expect(classifyBusyMagicWord('send')).toBe('send');
     expect(classifyBusyMagicWord('interrupt')).toBe('send');
@@ -163,7 +166,7 @@ describe('classifyBusyMagicWord (Matrix regression pins)', () => {
   });
 });
 
-describe('isIvSlashPassthrough (Matrix regression pin: unknown-slash passthrough + // escape)', () => {
+describe('isIvSlashPassthrough (journal command classification pin: unknown-slash passthrough + // escape)', () => {
   it('is true for an unknown slash command', () => {
     expect(isIvSlashPassthrough('/compact')).toBe(true);
     expect(isIvSlashPassthrough('/login')).toBe(true);
@@ -189,12 +192,13 @@ describe('isIvSlashPassthrough (Matrix regression pin: unknown-slash passthrough
   });
 });
 
-// Plan-mode `build` keyword (PR #101 follow-up). Matrix approves a pending
-// plan when the text is exactly "build" (case-insensitive, trimmed) and the
-// session has plan state (pendingPlan || pendingPlanDenialId ||
-// ivPendingPlanToolUseId). Decision shared here; the approval implementation
-// (approvePlanBuild, index.js) is reused AS-IS by both transports.
-describe('isPlanBuildText (Matrix regression pins)', () => {
+// Plan-mode `build` keyword (PR #101 follow-up). The journal path approves a
+// pending plan when the text is exactly "build" (case-insensitive, trimmed)
+// and the session has plan state (pendingPlan || pendingPlanDenialId ||
+// ivPendingPlanToolUseId) — originally Matrix's comparison, pinned here
+// unchanged since Matrix's retirement in Task 4. The approval implementation
+// (approvePlanBuild, index.js) is reused AS-IS.
+describe('isPlanBuildText (journal command classification pin)', () => {
   it("matches exactly the Matrix comparison: text.toLowerCase().trim() === 'build'", () => {
     expect(isPlanBuildText('build')).toBe(true);
     expect(isPlanBuildText('Build')).toBe(true);
@@ -288,14 +292,17 @@ describe('dispatchJournalBridgeCommand', () => {
     expect(flushCursor).toHaveBeenCalledOnce();
   });
 
-  // Matrix-only command safety net (Deliverable 2). Mapping handleCommand's
-  // actual switch found NO command that needs this today (see
-  // JOURNAL_UNAVAILABLE_COMMANDS's comment in lib/command-dispatch.js) — the
-  // real, shipped denylist is empty. These tests exercise the MECHANISM
-  // itself via the `unavailableCommands` override, so a future command
-  // added to the denylist is guaranteed to get a safe "not available" reply
-  // instead of silently falling through to Claude as text or crashing,
-  // without needing a live example to test against today.
+  // Journal-transport command safety net (Deliverable 2), for commands whose
+  // implementation needs context the journal transport doesn't have. Was
+  // framed as a "Matrix-only" concern before Matrix's retirement in Task 4;
+  // mapping handleCommand's actual switch found NO command that needs this
+  // today (see JOURNAL_UNAVAILABLE_COMMANDS's comment in
+  // lib/command-dispatch.js) — the real, shipped denylist is empty. These
+  // tests exercise the MECHANISM itself via the `unavailableCommands`
+  // override, so a future command added to the denylist is guaranteed to
+  // get a safe "not available" reply instead of silently falling through to
+  // Claude as text or crashing, without needing a live example to test
+  // against today.
   describe('the not-available denylist mechanism (JOURNAL_UNAVAILABLE_COMMANDS is empty today — see that constant\'s comment for the mapping)', () => {
     it('the real, shipped denylist has no entries', () => {
       expect(JOURNAL_UNAVAILABLE_COMMANDS.size).toBe(0);

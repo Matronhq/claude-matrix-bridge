@@ -579,9 +579,13 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
 // in-process, so pin by source inspection that (a) the journal input
 // consumer is actually handed a resumeSessionForConvo (the lib treats it as
 // optional, so omitting it silently reverts to the "no longer active" dead
-// end), and (b) the journal path and the Matrix room.message path respawn
-// persisted sessions through the SAME helper, so the two transports can't
-// drift apart on what a resume restores.
+// end), and (b) the journal resume path (journalResumeConvo) routes through
+// resumePersistedSession — the single shared respawn helper — instead of
+// reimplementing resume inline, and suppresses the helper's own room-facing
+// notice so a resume triggered from the journal produces exactly one
+// journal message. (Matrix had its own room.message auto-resume branch
+// through this same helper; it was removed in Task 4, leaving the journal
+// path as the sole caller.)
 describe('index.js journal input consumer — auto-resume wiring (source inspection)', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
@@ -596,11 +600,15 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(args).toMatch(/\bresumeSessionForConvo\b/);
   });
 
-  it('the Matrix auto-resume branch and the journal resume share one respawn helper', () => {
-    // 1 function declaration + at least 2 call sites (Matrix handler,
-    // journal resume).
+  it('the journal resume path routes through the single shared respawn helper', () => {
+    // Originally pinned "1 function declaration + at least 2 call sites
+    // (Matrix handler, journal resume)" — the Matrix auto-resume branch was
+    // removed in Task 4, so only the journal call site remains. The
+    // surviving invariant: resume isn't reimplemented inline in the journal
+    // path — journalResumeConvo still calls the one shared helper (1
+    // declaration + at least 1 call site).
     const uses = src.match(/\bresumePersistedSession\(/g) || [];
-    expect(uses.length).toBeGreaterThanOrEqual(3);
+    expect(uses.length).toBeGreaterThanOrEqual(2);
   });
 
   it('a journal-triggered resume produces ONE journal message, not two', () => {
@@ -615,9 +623,16 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(body).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: true \}\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
-    // notice (the session's own sendCallback/sendHtml stay mirrored).
+    // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
+    // the slice at the next surviving section header (Local HTTP API, which
+    // now immediately follows resumePersistedSession — the old anchor,
+    // `// --- Matrix Message Handler ---`, was deleted in Task 4) so the
+    // body stays scoped to resumePersistedSession itself; assert hEnd was
+    // actually found so a future rename can't silently widen this slice to
+    // near-EOF and pass by accident again.
     const hStart = src.indexOf('function resumePersistedSession(');
-    const hEnd = src.indexOf('\n// --- Matrix Message Handler ---', hStart);
+    const hEnd = src.indexOf('\n// --- Local HTTP API ---', hStart);
+    expect(hEnd).toBeGreaterThan(hStart);
     const hBody = src.slice(hStart, hEnd);
     expect(hBody).toMatch(/skipJournalMirror = false/);
     expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
