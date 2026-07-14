@@ -420,7 +420,12 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
-  let agentSessions = mergeAgentStates(existing.agentSessions, extra?.agentSessions);
+  // A newly created room (notably !resume) may inherit both providers from a
+  // different persisted room. Carry that live inherited map automatically so
+  // later narrow persistence calls cannot silently discard the inactive
+  // provider, then apply any explicit caller update on top.
+  let agentSessions = mergeAgentStates(existing.agentSessions, live?._agentSessions);
+  agentSessions = mergeAgentStates(agentSessions, extra?.agentSessions);
   if (activeAgent) {
     const currentState = getPersistedAgentState(existing, activeAgent, live?.chatHistory?.length || existing.chatHistory?.length || 0);
     const state = live?.agent === activeAgent
@@ -490,6 +495,12 @@ function listPersistedAgentSessions(agent, workdir = null) {
     });
   }
   return [...byId.values()].sort((a, b) => b.modified - a.modified);
+}
+
+function findPersistedAgentSession(agent, sessionId) {
+  if (!sessionId) return null;
+  return listPersistedAgentSessions(agent)
+    .find(entry => entry.sessionId === sessionId) || null;
 }
 
 // --- Session Manager ---
@@ -987,6 +998,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     restartCount: 0,
     claudeSessionId: resumeSessionId || null,
     journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || resumeSessionId || null,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
@@ -1201,6 +1213,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // journal protocol and existing persistence/routing code.
     claudeSessionId: resumeSessionId || null,
     journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || null,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persisted?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
@@ -1506,6 +1519,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     restartCount: 0,
     claudeSessionId: sessionId,
     journalConvoId: options.journalConvoId || persistedForRoom?.journalConvoId || sessionId,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persistedForRoom?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
@@ -4860,10 +4874,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
       }
 
+      // Resolve the bridge-owned record by provider-specific state before
+      // checking live rooms or creating a replacement room. The top-level
+      // sessionId only names whichever provider was active when that record
+      // was last written; the requested native ID may live in agentSessions.
+      resumePersisted ||= findPersistedAgentSession(selectedAgent, resumeSessionId);
+      const resumeConvoId = resumePersisted?.journalConvoId || null;
+
       // Check if there's already an active room for this agent session.
       for (const activeSession of sessions.values()) {
         if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
           await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active in another conversation.`);
+          return;
+        }
+        if (resumeConvoId && journalConvoIdFor(activeSession) === resumeConvoId && activeSession.alive) {
+          await sendReply(`Conversation ${resumeConvoId.slice(0, 8)}… is already active in another room.`);
           return;
         }
       }
@@ -4894,35 +4919,64 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
       // resume "just work" if /start --browser was used originally.
-      resumePersisted ||= getPersistedSession(sessionRoomId) || (resumeSessionId
-        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
-        : null);
+      const resumeHistory = Array.isArray(resumePersisted?.chatHistory)
+        ? resumePersisted.chatHistory
+        : [];
+      const resumeState = getPersistedAgentState(
+        resumePersisted,
+        selectedAgent,
+        resumeHistory.length,
+      );
+      const inheritedAgentSessions = mergeAgentStates(resumePersisted?.agentSessions, {
+        [selectedAgent]: {
+          ...resumeState,
+          sessionId: resumeSessionId,
+        },
+      });
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
-        : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
+        : resumeState.mcpExtras;
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
         agent: selectedAgent,
-        model: resumePersisted?.model,
+        model: resumeState.model,
         mcpExtras: effectiveResumeExtras,
+        journalConvoId: resumePersisted?.journalConvoId,
+        agentSessions: inheritedAgentSessions,
+        ...(selectedAgent === AGENT_CLAUDE
+          ? { interactive: resumeState.interactiveMode }
+          : {}),
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
-      session.chatHistory = Array.isArray(resumePersisted?.chatHistory) ? resumePersisted.chatHistory : [];
+      session.chatHistory = resumeHistory;
       session.pinnedSummaryText = resumePersisted?.pinnedSummaryText || '';
       session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
-      if (resumePersisted) hydrateAgentState(session, resumePersisted);
+      session._agentSessions = inheritedAgentSessions;
+      hydrateAgentState(session, {
+        ...(resumePersisted || {}),
+        agent: selectedAgent,
+        agentSessions: inheritedAgentSessions,
+      });
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the agent session ID.
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId, {
+        agent: selectedAgent,
+        agentSessions: inheritedAgentSessions,
+        journalConvoId: session.journalConvoId,
         chatHistory: session.chatHistory,
         pinnedSummaryText: session.pinnedSummaryText,
         pinnedSummaryEventId: session.pinnedSummaryEventId,
+        model: session.currentModel || null,
+        interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
+        mcpExtras: session.mcpExtras,
+        totalUsage: session.totalUsage,
+        turnCount: session.turnCount,
       });
 
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
