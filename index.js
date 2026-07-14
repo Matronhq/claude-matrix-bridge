@@ -53,6 +53,7 @@ import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
+import { buildSessionStatus, contextTokensFromUsage } from './lib/session-status.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -503,6 +504,58 @@ function journalActivity(session, state, detail) {
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
   journalPublisher.publishActivity(session.claudeSessionId, state, detail);
+}
+
+// Account-wide rate limits for the status frame, shared across all sessions
+// (they're a property of the account, not a session). Refreshed by shelling
+// out to `claude -p "/usage"` — a local command that costs no API tokens but
+// does boot a claude process, hence the throttle: at most one fetch per
+// LIMITS_REFRESH_MS, refreshed only when turns are actually ending (nothing
+// runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
+// turn every turn end into a spawn storm.
+const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
+const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+
+// Kick off a background limits refresh if the cache is stale. Returns the
+// in-flight promise (resolving true when the cache gained fresh lines) when
+// a fetch is running, or null when the cache is still fresh — callers use
+// the promise to repaint the status frame once new numbers land.
+function refreshUsageLimits(cwd) {
+  if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
+  if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
+    .then((raw) => {
+      const parsed = parseUsageLimits(raw);
+      usageLimitsCache.fetchedAt = Date.now();
+      if (parsed.ok) usageLimitsCache.lines = parsed.lines;
+      return parsed.ok;
+    })
+    .catch((e) => {
+      debug(`Usage limits refresh failed: ${e.message}`);
+      usageLimitsCache.fetchedAt = Date.now();
+      return false;
+    })
+    .finally(() => { usageLimitsCache.inflight = null; });
+  return usageLimitsCache.inflight;
+}
+
+// Publish the session's header data (model, context gauge, rate limits) as
+// an ephemeral status frame for Matron clients. Same skip-if-no-session-id
+// rule as journalActivity — never buffered, a late status would be stale.
+// The context tokens come from the last result event's usage
+// (session._lastContextTokens, set in the result handler); limits come from
+// the shared cache above. No dedup needed: this fires once per turn end,
+// and the journal server's per-convo cache makes redelivery idempotent.
+function journalStatus(session) {
+  if (!JOURNAL_ENABLED) return;
+  if (!session.claudeSessionId) return;
+  const status = buildSessionStatus({
+    model: session.currentModel || session.initData?.model,
+    contextTokens: session._lastContextTokens,
+    limits: usageLimitsCache.lines,
+  });
+  if (Object.keys(status).length === 0) return;
+  journalPublisher.publishStatus(session.claudeSessionId, status);
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -2355,6 +2408,23 @@ function handleClaudeEvent(session, event) {
       }
       if (typeof event.total_cost_usd === 'number') {
         session.totalUsage.cost_usd = event.total_cost_usd;
+      }
+
+      // Header status for Matron clients: the context gauge comes passively
+      // from this turn's usage (never by sending /context into the session —
+      // that would append its own report to the transcript, bump
+      // lastActivityAt, and race real turns), limits from the shared cache.
+      // A stale cache also kicks off a throttled background refresh; when it
+      // lands, repaint so the header doesn't wait a whole turn for fresh
+      // numbers.
+      const ctxTokens = contextTokensFromUsage(u);
+      if (ctxTokens) session._lastContextTokens = ctxTokens;
+      journalStatus(session);
+      const limitsRefresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
+      if (limitsRefresh) {
+        limitsRefresh.then((updated) => {
+          if (updated && session.alive) journalStatus(session);
+        });
       }
 
       // Send collected tool calls as one message before the result (only if showWorking)
