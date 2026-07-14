@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseUsageLimits, formatLimits } from '../lib/usage-limits.js';
+import { parseUsageLimits, parseResetsAt, formatLimits } from '../lib/usage-limits.js';
 
 // Real `claude -p "/usage" --output-format text` output (subscription account).
 // Note the middot separator (·) is the literal character Claude Code emits.
@@ -22,12 +22,12 @@ const RED = '#f85149';
 
 describe('parseUsageLimits', () => {
   it('extracts the Current session / week headline lines', () => {
-    const { ok, lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE);
+    const { ok, lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(ok).toBe(true);
     expect(lines).toEqual([
-      { label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)' },
-      { label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)' },
-      { label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)' },
+      { label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)', resets_at: '2026-07-09T00:59:00.000Z' },
+      { label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
+      { label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
     ]);
   });
 
@@ -49,6 +49,51 @@ describe('parseUsageLimits', () => {
     expect(parseUsageLimits('')).toEqual({ ok: false, lines: [] });
     expect(parseUsageLimits(null)).toEqual({ ok: false, lines: [] });
     expect(parseUsageLimits(undefined)).toEqual({ ok: false, lines: [] });
+  });
+
+  it('adds resets_at to lines when the reset text parses', () => {
+    const { lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
+    expect(lines.map((l) => l.resets_at)).toEqual([
+      '2026-07-09T00:59:00.000Z',
+      '2026-07-12T18:59:00.000Z',
+      '2026-07-12T18:59:00.000Z',
+    ]);
+  });
+
+  it('omits resets_at when the reset text does not parse', () => {
+    const { lines } = parseUsageLimits('Current session: 39% used · resets soon\n');
+    expect(lines).toHaveLength(1);
+    expect('resets_at' in lines[0]).toBe(false);
+  });
+});
+
+describe('parseResetsAt', () => {
+  const now = new Date('2026-07-08T00:00:00Z');
+
+  it('parses an am time to a UTC ISO timestamp', () => {
+    expect(parseResetsAt('Jul 9, 12:59am (UTC)', now)).toBe('2026-07-09T00:59:00.000Z');
+  });
+
+  it('parses a pm time', () => {
+    expect(parseResetsAt('Jul 12, 6:59pm (UTC)', now)).toBe('2026-07-12T18:59:00.000Z');
+  });
+
+  it('rolls to next year when the month/day is far in the past', () => {
+    expect(parseResetsAt('Jan 2, 3:00am (UTC)', new Date('2026-12-30T00:00:00Z')))
+      .toBe('2027-01-02T03:00:00.000Z');
+  });
+
+  it('keeps a reset less than 24h in the past in the current year', () => {
+    expect(parseResetsAt('Jul 9, 12:59am (UTC)', new Date('2026-07-09T06:00:00Z')))
+      .toBe('2026-07-09T00:59:00.000Z');
+  });
+
+  it('returns null on unparseable input', () => {
+    expect(parseResetsAt('soon', now)).toBeNull();
+    expect(parseResetsAt('', now)).toBeNull();
+    expect(parseResetsAt(null, now)).toBeNull();
+    expect(parseResetsAt('Julember 9, 12:59am (UTC)', now)).toBeNull();
+    expect(parseResetsAt('Jul 9, 12:59am (PST)', now)).toBeNull();
   });
 });
 
