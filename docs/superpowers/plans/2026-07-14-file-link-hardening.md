@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Denylist regexes are copied from PR #54 verbatim (basename + path-segment lists in Task 1) — do not "improve" them.
+- Denylist regexes: basename list is copied from PR #54 verbatim — do not "improve" it. Path-segment list gained three directory-segment patterns (`.env*/`, `secret(s)/`, `credential(s)/`) in Task 1's review round to flag files inside sensitive directories.
 - `MAX_VIEW_BYTES = 5 * 1024 * 1024`.
 - Serve-time rejections are a uniform `404` / `File not found` — the response must not distinguish denied / missing / oversize / symlink (no information leak). Existing 400 (missing token) and 403 (bad token) behavior unchanged.
 - Legacy tokens (payload without `workdir`) still get denylist + symlink + size checks; only containment is skipped.

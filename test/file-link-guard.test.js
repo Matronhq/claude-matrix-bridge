@@ -14,6 +14,8 @@ describe('isSensitivePath', () => {
     '/w/service-account-prod.json', '/w/.htpasswd', '/w/config.json',
     '/home/u/.aws/anything.txt', '/home/u/.ssh/known_hosts', '/home/u/.kube/cfg',
     '/home/u/.docker/x', '/home/u/.gnupg/x',
+    '/w/.env/apikey.dat', '/w/.env.production/x.dat', '/w/secrets/db.dat',
+    '/w/secret/note.txt', '/w/credentials/token.dat',
   ])('flags %s', (p) => {
     expect(isSensitivePath(p)).toBe(true);
   });
@@ -21,6 +23,7 @@ describe('isSensitivePath', () => {
   it.each([
     '/w/index.js', '/w/env.md', '/w/configuration.json', '/w/package.json',
     '/w/README.md', '/w/awsome/notes.txt', '/w/keyboard.js',
+    '/w/secretary/notes.txt', '/w/credentialing/doc.md',
   ])('allows %s', (p) => {
     expect(isSensitivePath(p)).toBe(false);
   });
@@ -114,6 +117,18 @@ describe('validateAndOpen', () => {
   it('skips containment for legacy calls without a workdir', async () => {
     const { content } = await validateAndOpen(path.join(outside, 'target.txt'), {});
     expect(content.toString('utf-8')).toBe('outside content\n');
+  });
+
+  it('rejects a file reached through a symlinked ancestor directory', async () => {
+    symlinkSync(outside, path.join(dir, 'linkdir'));
+    expect(await denied(path.join(dir, 'linkdir', 'target.txt'), { workdir: dir })).toBe('outside-workdir');
+  });
+
+  it('allows a legitimate file when the workdir itself is a symlink', async () => {
+    const wdLink = path.join(outside, 'wd-link');
+    symlinkSync(dir, wdLink);
+    const { content } = await validateAndOpen(path.join(dir, 'ok.txt'), { workdir: wdLink });
+    expect(content.toString('utf-8')).toBe('hello guard\n');
   });
 
   it('exports a 5MB default cap', () => {

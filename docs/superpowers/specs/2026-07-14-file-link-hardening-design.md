@@ -29,9 +29,12 @@ existing plain-text rendering — that IS the off state).
   `*.pem/key/p12/pfx/jks/keystore`, `id_rsa`/`id_ed25519`/`id_ecdsa`,
   `.npmrc`, `.netrc`, `token(s).(json|txt)`, `service[-_]account*.json`,
   `.htpasswd`, `config.json` (this ecosystem's config.json files hold
-  tokens — `~/.claude-matrix-config.json`). Path patterns: any segment under
-  `/.aws/`, `/.docker/`, `/.kube/`, `/.ssh/`, `/.gnupg/`. All
-  case-insensitive. Same lists as PR #54.
+  tokens — `~/.claude-matrix-config.json`). Path patterns: basename patterns
+  from PR #54 verbatim; path-segment patterns added in review flag files
+  inside sensitive directories — `/.aws/`, `/.docker/`, `/.kube/`, `/.ssh/`,
+  `/.gnupg/` (dot-dirs from PR #54), plus `/.env*/`, `/secret(s)/`,
+  `/credential(s)/` (files INSIDE such directories are denied regardless of
+  basename). All case-insensitive.
 - `checkFileLink(filePath, workdir)` — sync generation-time gate. Returns
   `{ ok: true }` or `{ ok: false, reason: 'sensitive' | 'outside-workdir' }`.
   Containment is lexical (`path.resolve` prefix with a `/` boundary so
