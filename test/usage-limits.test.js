@@ -95,6 +95,26 @@ describe('parseResetsAt', () => {
     expect(parseResetsAt('Julember 9, 12:59am (UTC)', now)).toBeNull();
     expect(parseResetsAt('Jul 9, 12:59am (PST)', now)).toBeNull();
   });
+
+  it('fails open on stale mid-year text more than 24h in the past', () => {
+    expect(parseResetsAt('Jul 9, 12:59am (UTC)', new Date('2026-08-15T00:00:00Z')))
+      .toBeNull();
+  });
+
+  it('still rolls Dec->Jan when the reset is imminent', () => {
+    expect(parseResetsAt('Jan 1, 12:59am (UTC)', new Date('2026-12-31T12:00:00Z')))
+      .toBe('2027-01-01T00:59:00.000Z');
+  });
+
+  it('parses a previous-year date just past midnight within tolerance', () => {
+    expect(parseResetsAt('Dec 31, 11:59pm (UTC)', new Date('2027-01-01T06:00:00Z')))
+      .toBe('2026-12-31T23:59:00.000Z');
+  });
+
+  it('fails open when the date is beyond the 8-day future horizon', () => {
+    expect(parseResetsAt('Jul 20, 12:00pm (UTC)', new Date('2026-07-01T00:00:00Z')))
+      .toBeNull();
+  });
 });
 
 describe('formatLimits', () => {
