@@ -1,6 +1,6 @@
 # Matron custom-event protocol — bridge contract (Phase 5 companion spec)
 
-> Companion to matron-iOS-app
+> Companion to matron-apple
 > `docs/superpowers/plans/2026-05-02-matron-ios-phase-5-custom-events.md`.
 > Drafted 2026-06-12 from the Phase 5 implementation session. Status:
 > **proposal** — nothing here is required for the apps to keep working;
