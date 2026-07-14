@@ -288,11 +288,14 @@ describe('createToolStreamPump', () => {
     // ever happens in this test. With a 50-byte budget the pump can only
     // publish 50 bytes per pass, so full drain REQUIRES self-scheduling
     // follow-up passes; fs.watch will never fire again since nothing more is
-    // written. throttleMs is small but nonzero so passes are genuinely
-    // spaced out (not one synchronous unwind), exercising the real
-    // self-schedule path.
+    // written. throttleMs: 0 is deliberate: schedulePump() always defers
+    // through setTimeout now (even when the throttle window has already
+    // elapsed), so a zero throttle no longer collapses the self-schedule
+    // loop into synchronous recursion — this is exactly the previously
+    // dangerous case (a long budget-capped drain chaining synchronous
+    // pump() calls, one stack frame per pass) that the fix retires.
     const content = 'x'.repeat(500);
-    const { sink, pump, cleanup } = setup({ preContent: content, throttleMs: 5, maxBytesPerPass: 50 });
+    const { sink, pump, cleanup } = setup({ preContent: content, throttleMs: 0, maxBytesPerPass: 50 });
     try {
       pump.start();
       await waitFor(() => sink.content() === content, 5000);

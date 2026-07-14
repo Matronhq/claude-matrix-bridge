@@ -2525,15 +2525,29 @@ function handleClaudeEvent(session, event) {
         for (const block of userContent) {
           // Mark live-output complete on tool_result for any tracked Bash command.
           if (block.type === 'tool_result' && block.tool_use_id) {
-            const blockText = typeof block.content === 'string'
-              ? block.content
-              : (Array.isArray(block.content)
-                  ? block.content.filter(c => c && c.type === 'text').map(c => c.text || '').join('')
-                  : '');
-            const denied = /permission/i.test(blockText);
-            const truncated = blockText.includes('[matron-tee: output truncated');
-            const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
-            const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
+            const entry = liveOutputStore.get(block.tool_use_id);
+            // Only pay for the blockText join + three regex scans below when
+            // something will actually consume the result: either the
+            // liveOutputStore entry (markComplete below) or a still-registered
+            // tool-stream pump (stopAndFinalizeToolStream, which no-ops when
+            // there's no pump). Otherwise this ran on EVERY tool_result of
+            // every tool — O(content) string work discarded whenever both are
+            // absent, which is the common case.
+            const pumpRegistered = JOURNAL_ENABLED && session.claudeSessionId
+              && toolStreamPumps.has(toolStreamKey(session.claudeSessionId, block.tool_use_id));
+            let opts;
+            if (entry || pumpRegistered) {
+              const blockText = typeof block.content === 'string'
+                ? block.content
+                : (Array.isArray(block.content)
+                    ? block.content.filter(c => c && c.type === 'text').map(c => c.text || '').join('')
+                    : '');
+              const denied = /permission/i.test(blockText);
+              const truncated = blockText.includes('[matron-tee: output truncated');
+              const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
+              const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
+              opts = { exitCode, denied, truncated };
+            }
             // Unconditional on every tool_result (fast-follow brief Item 4):
             // must NOT sit behind the liveOutputStore lookup below.
             // liveOutputStore entries are TTL-gc'd independently of the
@@ -2544,10 +2558,13 @@ function handleClaudeEvent(session, event) {
             // when there's no toolStreamPumps entry for this key or the
             // journal is disabled, so calling it here for every tool_result
             // (Read/Write/Edit included, not just Bash) is safe and cheap.
-            stopAndFinalizeToolStream(session, block.tool_use_id, { exitCode, denied, truncated });
-            const entry = liveOutputStore.get(block.tool_use_id);
+            // When the derivation above was skipped, opts is undefined and
+            // finalizeToolStreamEntry's own defaults (exitCode: null,
+            // denied: false, truncated: false) apply — same as today's
+            // absent-value defaults.
+            stopAndFinalizeToolStream(session, block.tool_use_id, opts);
             if (entry) {
-              liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
+              liveOutputStore.markComplete(block.tool_use_id, opts);
               // The tracked tool that put us in 'tool' just completed and
               // Claude continues — back to 'thinking'. Gated on activity
               // state, NOT session.busy (Bugbot finding #2): iv-mode
