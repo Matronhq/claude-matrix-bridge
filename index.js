@@ -36,6 +36,7 @@ import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   classifyBridgeCommand,
+  classifyPrintRescue,
   classifyRescueKeystroke,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
@@ -45,6 +46,8 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
+import { sendPrintInterrupt } from './lib/print-interrupt.js';
+import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -53,6 +56,8 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
+import { contextFullToNative, briefContextReport } from './lib/context-command.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, emailFromClaudeConfig } from './lib/session-status.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -265,10 +270,23 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath) {
+function generateFileLink(filePath, workdir) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  // Normalize BEFORE gating and signing: a relative session.workdir (or
+  // target) would otherwise resolve against the wrong process cwd in the
+  // viewer, or trip the guard's relative-path check and kill the link.
+  const absTarget = path.resolve(filePath);
+  const absWorkdir = workdir ? path.resolve(workdir) : null;
+  // Generation-time gate (UX — the viewer re-validates at serve time with
+  // the fd-pinned checks): sensitive names and out-of-workdir targets never
+  // get a link; callers render plain text on null.
+  const gate = checkFileLink(absTarget, absWorkdir);
+  if (!gate.ok) {
+    console.log(`file-link denied (${gate.reason}): ${absTarget}`);
+    return null;
+  }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -524,7 +542,7 @@ function publishEditDiff(session, toolName, input, label) {
     journalPublish(session, 'publishDiff', {
       file_path: absPath,
       display_path: input.file_path,
-      viewer_url: generateFileLink(absPath),
+      viewer_url: generateFileLink(absPath, session.workdir),
       tool: toolName,
       label: label || null,
       diff: result.diff,
@@ -537,6 +555,83 @@ function publishEditDiff(session, toolName, input, label) {
   }).catch(e => {
     debug('publishEditDiff failed: %s', e?.message);
   });
+}
+
+// Account-wide rate limits for the status frame, shared across all sessions
+// (they're a property of the account, not a session). Refreshed by shelling
+// out to `claude -p "/usage"` — a local command that costs no API tokens but
+// does boot a claude process, hence the throttle: at most one fetch per
+// LIMITS_REFRESH_MS, refreshed only when turns are actually ending (nothing
+// runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
+// turn every turn end into a spawn storm.
+const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
+const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+
+// Kick off a background limits refresh if the cache is stale. Returns the
+// in-flight promise (resolving true when the cache gained fresh lines) when
+// a fetch is running, or null when the cache is still fresh — callers use
+// the promise to repaint the status frame once new numbers land.
+function refreshUsageLimits(cwd) {
+  // The cache exists solely to feed status frames — with the journal
+  // disabled nothing consumes it, and each refresh boots a claude process.
+  if (!JOURNAL_ENABLED) return null;
+  if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
+  if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
+    .then((raw) => {
+      const parsed = parseUsageLimits(raw);
+      usageLimitsCache.fetchedAt = Date.now();
+      if (parsed.ok) usageLimitsCache.lines = parsed.lines;
+      return parsed.ok;
+    })
+    .catch((e) => {
+      debug(`Usage limits refresh failed: ${e.message}`);
+      usageLimitsCache.fetchedAt = Date.now();
+      return false;
+    })
+    .finally(() => { usageLimitsCache.inflight = null; });
+  return usageLimitsCache.inflight;
+}
+
+// Logged-in account email for the status frame, read from ~/.claude.json's
+// oauthAccount (the same account every session on this bridge runs as). It
+// only changes on re-login, so cache on the same cadence as the limits
+// refresh — a ~45KB read+parse at most once per window. Read failures (file
+// missing mid-login, torn write) just return the previous value; a stale
+// email beats a flickering one.
+const accountEmailCache = { email: null, fetchedAt: 0 };
+
+function getAccountEmail() {
+  if (Date.now() - accountEmailCache.fetchedAt < LIMITS_REFRESH_MS) return accountEmailCache.email;
+  accountEmailCache.fetchedAt = Date.now();
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf-8'));
+    accountEmailCache.email = emailFromClaudeConfig(config);
+  } catch (e) {
+    debug(`Could not read account email from ~/.claude.json: ${e.message}`);
+  }
+  return accountEmailCache.email;
+}
+
+// Publish the session's header data (model, context gauge, rate limits) as
+// an ephemeral status frame for Matron clients. Same skip-if-no-session-id
+// rule as journalActivity — never buffered, a late status would be stale.
+// The context tokens (session._lastContextTokens) come from the turn's last
+// parent assistant event's usage (set in case 'assistant'), or from the
+// compact_boundary's post-compact size right after a compaction; limits come
+// from the shared cache above. No dedup needed: this fires once per turn
+// end, and the journal server's per-convo cache makes redelivery idempotent.
+function journalStatus(session) {
+  if (!JOURNAL_ENABLED) return;
+  if (!session.claudeSessionId) return;
+  const status = buildSessionStatus({
+    model: session.currentModel || session.initData?.model,
+    contextTokens: session._lastContextTokens,
+    limits: usageLimitsCache.lines,
+    email: getAccountEmail(),
+  });
+  if (Object.keys(status).length === 0) return;
+  journalPublisher.publishStatus(session.claudeSessionId, status);
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -834,6 +929,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // server's 30-min idle sweep. Runs on every path below, including
     // auto-restart.
     sweepToolStreams(session);
+    clearPendingInterrupt(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -2034,6 +2130,15 @@ function handleClaudeEvent(session, event) {
 
   switch (event.type) {
     case 'assistant': {
+      // Track the context gauge from each parent assistant event's usage —
+      // the last one standing when the turn ends is the final request's
+      // footprint, which is what the header should show. The result event's
+      // own usage is deliberately NOT used: it's cumulative across all the
+      // turn's API calls (see lib/session-status.js), which is how the gauge
+      // once read 2m/1m.
+      const assistantCtxTokens = contextTokensFromAssistantEvent(event);
+      if (assistantCtxTokens) session._lastContextTokens = assistantCtxTokens;
+
       const content = event.message?.content;
       if (!Array.isArray(content)) break;
 
@@ -2344,6 +2449,7 @@ function handleClaudeEvent(session, event) {
           // Reset busy/typing so the session isn't stuck if claude exits 0
           // without our normal result-handling path running.
           session.busy = false;
+          clearPendingInterrupt(session);
           if (session.typingInterval) {
             clearInterval(session.typingInterval);
             session.typingInterval = null;
@@ -2376,6 +2482,20 @@ function handleClaudeEvent(session, event) {
         session.totalUsage.cost_usd = event.total_cost_usd;
       }
 
+      // Header status for Matron clients: the context gauge was tracked from
+      // this turn's assistant events (see case 'assistant' — result usage is
+      // cumulative across the turn's API calls, so it must not feed the
+      // gauge), limits from the shared cache. A stale cache also kicks off a
+      // throttled background refresh; when it lands, repaint so the header
+      // doesn't wait a whole turn for fresh numbers.
+      journalStatus(session);
+      const limitsRefresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
+      if (limitsRefresh) {
+        limitsRefresh.then((updated) => {
+          if (updated && session.alive) journalStatus(session);
+        });
+      }
+
       // Send collected tool calls as one message before the result (only if showWorking)
       if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
         const toolSummary = session.toolCalls.join('\n');
@@ -2401,6 +2521,7 @@ function handleClaudeEvent(session, event) {
       // (the durable publish already cleared the ref).
       journalStreamClear(session);
       session.busy = false;
+      clearPendingInterrupt(session);
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
@@ -2487,6 +2608,18 @@ function handleClaudeEvent(session, event) {
         debug('task_notification suppressed (status=%s): %s',
           event.status, (event.summary || 'unknown').slice(0, 120));
       } else if (event.subtype === 'compact_boundary') {
+        // Repaint the header gauge with the post-compact context size the
+        // boundary carries — for both manual and auto triggers. Without
+        // this, the status frame published at the compact turn's end reuses
+        // _lastContextTokens from BEFORE the compaction (the compact run's
+        // own result usage is all zeros), so the user compacts and still
+        // sees the old near-full gauge.
+        const postTokens = postCompactContextTokens(event);
+        if (postTokens) {
+          session._lastContextTokens = postTokens;
+          journalStatus(session);
+        }
+
         // A manual `/compact` finishes here: the transcript writes a
         // compact_boundary marker but — unlike a normal turn — no Stop hook
         // fires, so onTurnEnd (the authoritative iv turn-end signal) never
@@ -2525,6 +2658,7 @@ function handleClaudeEvent(session, event) {
             // unrelated event cleared it. No-op when nothing was streaming.
             journalStreamClear(session);
             session.busy = false;
+            clearPendingInterrupt(session);
           }
         }
       }
@@ -2642,10 +2776,22 @@ function extractTextContent(event) {
 }
 
 function flushResponse(session) {
-  const text = session.responseBuffer.trim();
+  let text = session.responseBuffer.trim();
   session.responseBuffer = '';
 
   if (!text) return;
+
+  // /context reports get trimmed to their Model/Tokens headline — the full
+  // table dump is noise on a phone-sized client. /context-full (rewritten to
+  // /context in sendToSession) arms a one-shot escape hatch, consumed by the
+  // NEXT flush whether or not it turned out to be a report: a /context-full
+  // whose report never arrived (error, interrupt) must not leave the flag
+  // armed for a later, unrelated /context. Chat history and the journal
+  // mirror get the same trimmed text the user sees.
+  const wantFull = session._contextFullOnce;
+  if (wantFull) session._contextFullOnce = false;
+  const briefReport = briefContextReport(text);
+  if (briefReport && !wantFull) text = briefReport;
 
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
@@ -2723,6 +2869,21 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
+
+  // /context-full is a bridge-only command — claude itself knows only
+  // /context. Rewrite it here, the single choke point every transport
+  // funnels through (Matrix messages, journal-routed text, queue flushes),
+  // and arm the one-shot flag flushResponse consumes to let the resulting
+  // report through untrimmed. Placed after the journal mirror above so the
+  // journal records what the user actually typed. Plain /context needs no
+  // marking: flushResponse trims any context report by default.
+  if (contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
+    const nativeContext = contextFullToNative(contentBlocks[0].text);
+    if (nativeContext) {
+      session._contextFullOnce = true;
+      contentBlocks = [{ type: 'text', text: nativeContext }];
+    }
+  }
 
   if (session.iv) {
     // Interactive mode: type text blocks into the PTY. Non-text content
@@ -3921,10 +4082,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      // Confirm in origin room with a link to the new room
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      // Confirm in the origin room/convo. No matrix.to room link: Matron is
+      // the only client now, and its new conversation appears on its own —
+      // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
+      await sendReply(`Session started in a new conversation${extrasNote}.`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -4050,10 +4212,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       // Check if there's already an active room for this Claude session
-      for (const [activeRoomId, activeSession] of sessions) {
+      for (const activeSession of sessions.values()) {
         if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
-          const roomLink = `https://matrix.to/#/${activeRoomId}`;
-          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active: ${roomLink}`);
+          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active in another conversation.`);
           return;
         }
       }
@@ -4101,8 +4262,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Persist immediately — we already know the session ID, don't wait for Claude's event
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
 
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
+      await sendReply(`Resuming session ${shortId}… in a new conversation.`);
       const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
@@ -4164,8 +4324,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
+      await sendReply(`Session started in a new conversation.\nWorkdir: ${resolved}`);
       const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
       const wdHtml =
         `<b>Session started</b><br/>` +
@@ -4319,7 +4478,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "interrupt" to force interrupt\n\n` +
+        `  Send "interrupt" to force interrupt\n` +
+        `  !esc — cancel claude's current turn without killing the session\n\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -4358,6 +4518,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
+        `<li><code>!esc</code> — cancel claude's current turn without killing the session</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -4806,7 +4967,9 @@ async function journalRouteTextToSession(session, body) {
   // guidance to "send !esc to cancel" works identically from Matron. Same
   // replay guard as the bridge-command dispatch above (inside
   // dispatchJournalRescueKeystroke): !esc/!enter have real side effects
-  // (keystrokes into the TUI, clearing busy state).
+  // (keystrokes into the TUI, clearing busy state). Print-mode sessions
+  // route !esc/!escape to printModeInterrupt via the printActive branch
+  // instead.
   const dispatchedRescue = await dispatchJournalRescueKeystroke(trimmed, !!(session.iv && session.iv.alive), {
     flushCursor: () => journalPublisher.flushCursor(),
     sendRescueKeystroke: async (rescue) => {
@@ -4835,6 +4998,11 @@ async function journalRouteTextToSession(session, body) {
       } catch (err) {
         ctx.sendReply(`Could not send Esc: ${err.message}`);
       }
+    },
+    printActive: !!(session.proc && session.alive && !(session.iv && session.iv.alive)),
+    sendPrintInterrupt: async () => {
+      const ctx = journalSessionCommandCtx(session);
+      await printModeInterrupt(session, (m) => ctx.sendReply(m));
     },
   });
   if (dispatchedRescue) return;
@@ -5107,7 +5275,10 @@ function journalResumeConvo(convoId) {
     if (existing) sessions.delete(roomId);
     console.log(`[journal-input] auto-resuming reaped session ${convoId} in ${roomId}`);
     journalPublishNotice(convoId, '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.');
-    return resumePersistedSession(roomId, prev);
+    // This notice IS the journal's resume announcement — tell the shared
+    // helper not to also mirror its room-facing "Auto-resuming session…"
+    // notice into the journal, or Matron users see both.
+    return resumePersistedSession(roomId, prev, { skipJournalMirror: true });
   }
   return null;
 }
@@ -5261,7 +5432,12 @@ async function approvePlanBuild(session, { sendHtml }) {
 // drift apart on what a resume restores. Synchronous — the "Auto-resuming…"
 // room notice is fire-and-forget, which is what lets the journal router's
 // sync consumer call this directly.
-function resumePersistedSession(roomId, prev) {
+//
+// skipJournalMirror applies to that notice only (the session's own
+// sendCallback/sendHtml stay mirrored as usual): the journal resume path
+// posts its own richer "Session was idle" notice first, and without the
+// skip Matron users would see both.
+function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
@@ -5277,7 +5453,7 @@ function resumePersistedSession(roomId, prev) {
 
   const shortId = prev.sessionId.slice(0, 8);
   const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
-  Promise.resolve(sendHtmlFn(arNotice.plain, arNotice.html)).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
@@ -5599,6 +5775,14 @@ client.on('room.message', async (roomId, event) => {
       }
       return;
     }
+  } else if (classifyPrintRescue(text)) {
+    // Print-mode counterpart: cancel the current turn via a control_request
+    // on the CLI's stdin. Runs before busy-queueing for the same reason the
+    // iv branch does — interrupting is exactly what you need while busy.
+    // !stop deliberately keeps its stop-session meaning here (handled by the
+    // command dispatch above); !enter stays iv-only.
+    await printModeInterrupt(session, sendReply);
+    return;
   }
   if (session.busy && !isClaudeSlashCommand) {
     // Busy-queue magic words: bare send/interrupt/!interrupt flush the queue
@@ -6385,6 +6569,60 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   return next;
 }
 
+// Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc
+// keystroke rescue, shared verbatim by the Matrix handler and the journal
+// session-text route (same convention as approvePlanBuild). The turn's
+// `result` event is the success signal: it clears busy and cancels the
+// fallback timer via clearPendingInterrupt. The timer only fires if the CLI
+// never delivers one (wedged process), so the bridge stops queueing
+// messages behind a busy flag nothing will ever clear.
+async function printModeInterrupt(session, sendReply) {
+  if (!session.proc || !session.alive) {
+    await sendReply('No claude process to interrupt.');
+    return;
+  }
+  if (!session.busy) {
+    await sendReply('Nothing to interrupt — claude is idle.');
+    return;
+  }
+  if (session.pendingInterrupt) {
+    await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
+    return;
+  }
+  session.pendingInterrupt = sendPrintInterrupt({
+    stdin: session.proc.stdin,
+    onWedge: () => {
+      session.pendingInterrupt = null;
+      if (!session.busy) return;
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+      journalSessionState(session, 'waiting');
+      journalActivity(session, 'idle');
+      Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
+    },
+    onError: (err) => {
+      Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});
+    },
+  });
+  if (session.pendingInterrupt) {
+    await sendReply('⏹ Interrupt sent — waiting for claude to stop this turn.');
+  }
+}
+
+// Cancels a pending interrupt's wedge timer. Called wherever busy state
+// resolves for real (result event, fatal-error result path, killSession) —
+// a stale timer firing into a later turn would falsely clear its busy flag.
+function clearPendingInterrupt(session) {
+  if (session.pendingInterrupt) {
+    session.pendingInterrupt.cancel();
+    session.pendingInterrupt = null;
+  }
+}
+
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
   // Stop the subagent watcher up-front so its tails and burst timer don't
@@ -6401,6 +6639,7 @@ function killSession(session, signal = 'SIGTERM') {
   // a process that died without delivering tool_result leaves pumps
   // dangling.
   sweepToolStreams(session);
+  clearPendingInterrupt(session);
 
   if (!session.alive) return;
   try {
