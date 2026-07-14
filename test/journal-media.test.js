@@ -98,10 +98,26 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/isn't available/));
   });
 
-  it('never throws even when a dep throws', async () => {
+  it('never throws even when a dep throws — and notices the user', async () => {
     const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => { throw new Error('boom'); }) });
     await expect(route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf' }, ctx)).resolves.toBeUndefined();
     expect(deps.injectBlocks).not.toHaveBeenCalled();
+    // The room already shows a success-style echo; an unexpected throw must
+    // leave the same kind of journal notice the fetch-failure path does.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringContaining("Couldn't deliver"));
+  });
+
+  it('a fetched audio/* type is transcribed even when the frame declared a generic type', async () => {
+    // The client uploaded with application/octet-stream but the store knows
+    // it's audio — the declared type must not shadow the fetched one, or the
+    // voice note gets saved as a file instead of transcribed.
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('aac'), contentType: 'audio/mp4' })),
+    });
+    await route(session, { type: 'file', blobRef: 'vn', contentType: 'application/octet-stream', name: 'voice-note.m4a' }, ctx);
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+    expect(deps.transcribe.mock.calls[0][1]).toBe('audio/mp4');
+    expect(deps.buildSavedBlocks).not.toHaveBeenCalled();
   });
 });
 
