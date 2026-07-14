@@ -13,6 +13,7 @@ import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
+import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
@@ -502,6 +503,39 @@ function journalActivity(session, state, detail) {
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
   journalPublisher.publishActivity(session.claudeSessionId, state, detail);
+}
+
+// Compute and publish a structured `diff` journal event for an
+// Edit/Write/MultiEdit tool_use — the journal-only replacement for the old
+// "✏️ Editing [path](link)" Matrix indicator (Dan, 2026-07-14; spec in
+// matron-apple docs/superpowers/specs/2026-07-14-diff-cards-design.md).
+// `label` is the subagent label, null for the parent agent. Published at
+// tool_use time, same semantics as the old message (a denied edit still
+// shows its card). Fire-and-forget async (Write reads the file); every
+// failure path is swallowed — journal problems never touch the Matrix
+// hot path.
+function publishEditDiff(session, toolName, input, label) {
+  if (!JOURNAL_ENABLED || !input?.file_path) return;
+  const absPath = path.isAbsolute(input.file_path)
+    ? input.file_path
+    : path.join(session.workdir, input.file_path);
+  computeEditDiff(toolName, input, session.workdir).then(result => {
+    if (!result) return;
+    journalPublish(session, 'publishDiff', {
+      file_path: absPath,
+      display_path: input.file_path,
+      viewer_url: generateFileLink(absPath),
+      tool: toolName,
+      label: label || null,
+      diff: result.diff,
+      added: result.added,
+      removed: result.removed,
+      truncated: result.truncated,
+      new_file: result.newFile,
+    });
+  }).catch(e => {
+    debug('publishEditDiff failed: %s', e?.message);
+  });
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -1859,13 +1893,6 @@ function resolveQuestionAnswer(session, text) {
 // liveOutput/showWorking machinery.
 function formatSubagentToolIndicator(label, toolName, input) {
   const safeLabel = `<i>${escapeHtml(label)}</i>`;
-  if ((toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit') && input.file_path) {
-    const verb = toolName === 'Write' ? 'Writing' : 'Editing';
-    return {
-      plain: `🔀[${label}] ✏️ ${verb} ${input.file_path}`,
-      html: `🔀[${safeLabel}] ✏️ ${verb} <code>${escapeHtml(input.file_path)}</code>`,
-    };
-  }
   if (toolName === 'WebSearch' && input.query) {
     return {
       plain: `🔀[${label}] 🌐 ${input.query}`,
@@ -1947,6 +1974,14 @@ function handleSubagentEvent(session, { label, event }) {
       // discovery burst so the nested agent-<id>.jsonl gets a tail.
       if ((block.name === 'Task' || block.name === 'Agent') && session.subagentWatcher) {
         session.subagentWatcher.notifyTaskStarted();
+      }
+      if ((block.name === 'Edit' || block.name === 'Write' || block.name === 'MultiEdit')
+          && block.input?.file_path) {
+        // Rich diff card instead of the "🔀[label] ✏️ Editing …" line —
+        // journal-only, same contract as the parent-agent path.
+        publishEditDiff(session, block.name, block.input, label);
+        session.lastActivityAt = Date.now();
+        continue;
       }
       const formatted = formatSubagentToolIndicator(label, block.name, block.input || {});
       if (!formatted) continue;
@@ -2225,32 +2260,16 @@ function handleClaudeEvent(session, event) {
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
             indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
-          } else if (toolName === 'Write' && input.file_path) {
-            isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Writing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Writing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Writing ${input.file_path}`;
-              indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
-            }
-          } else if (toolName === 'Edit' && input.file_path) {
-            isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Editing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Editing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Editing ${input.file_path}`;
-              indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
-            }
+          } else if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit')
+                     && input.file_path) {
+            // Journal-only (Dan, 2026-07-14): a structured `diff` event
+            // replaces the old "✏️ Editing [path](link)" room message —
+            // isKeyEvent stays false, so nothing posts to Matrix and
+            // nothing mirrors into the journal as text. session.toolCalls
+            // below still gets this plain line for the turn summary.
+            const verb = toolName === 'Write' ? 'Writing' : 'Editing';
+            indicator = `✏️ ${verb} ${input.file_path}`;
+            publishEditDiff(session, toolName, input, null);
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
             indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
