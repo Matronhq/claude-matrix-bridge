@@ -294,6 +294,7 @@ describe('createJournalPublisher', () => {
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
       pub.publishImage('c1', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 1, from: 'user' });
       pub.publishActivity('c1', 'thinking');
+      pub.publishStatus('c1', { model: 'x' });
       pub.markRead('c1');
       pub.close();
       pub.close(); // idempotent
@@ -338,6 +339,56 @@ describe('createJournalPublisher', () => {
     const [f1, f2] = fake.received.filter(f => f.op === 'activity');
     expect(f1).toEqual({ op: 'activity', convo_id: 'c1', state: 'thinking' });
     expect(f2).toEqual({ op: 'activity', convo_id: 'c1', state: 'tool', detail: 'rake test:run' });
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishStatus: sends {op, convo_id, status} once connected, with no idem_key', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    const status = { model: 'claude-fable-5', context: { tokens: 253_412, window: 1_000_000, pct: 25 } };
+    pub.publishStatus('c1', status);
+    await waitFor(() => fake.received.some(f => f.op === 'status'));
+
+    const frame = fake.received.find(f => f.op === 'status');
+    expect(frame).toEqual({ op: 'status', convo_id: 'c1', status });
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishStatus is NOT queued: a call while disconnected is dropped silently', async () => {
+    const port = await getFreePort(); // nothing listening yet
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.publishStatus('c1', { model: 'x' }); // must be dropped: no connection yet
+    await delay(80);
+
+    const fake = await startFakeServer({}, port);
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+    await delay(150);
+    expect(fake.received.filter(f => f.op === 'status').length).toBe(0);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishStatus never throws on unserializable status', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    const cyclic = {};
+    cyclic.self = cyclic;
+    expect(() => pub.publishStatus('c1', cyclic)).not.toThrow();
 
     pub.close();
     await fake.close();
