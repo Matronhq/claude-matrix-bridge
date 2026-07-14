@@ -1,0 +1,122 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import {
+  isSensitivePath, checkFileLink, validateAndOpen, FileLinkDenied, MAX_VIEW_BYTES,
+} from '../lib/file-link-guard.js';
+
+describe('isSensitivePath', () => {
+  it.each([
+    '/w/.env', '/w/.env.local', '/w/prod.env', '/w/secrets.yaml', '/w/secret.json',
+    '/w/credentials', '/w/credentials.json', '/w/server.pem', '/w/app.key',
+    '/w/id_rsa', '/w/id_ed25519.pub', '/w/.npmrc', '/w/.netrc', '/w/tokens.json',
+    '/w/service-account-prod.json', '/w/.htpasswd', '/w/config.json',
+    '/home/u/.aws/anything.txt', '/home/u/.ssh/known_hosts', '/home/u/.kube/cfg',
+    '/home/u/.docker/x', '/home/u/.gnupg/x',
+  ])('flags %s', (p) => {
+    expect(isSensitivePath(p)).toBe(true);
+  });
+
+  it.each([
+    '/w/index.js', '/w/env.md', '/w/configuration.json', '/w/package.json',
+    '/w/README.md', '/w/awsome/notes.txt', '/w/keyboard.js',
+  ])('allows %s', (p) => {
+    expect(isSensitivePath(p)).toBe(false);
+  });
+});
+
+describe('checkFileLink', () => {
+  it('denies sensitive names with reason', () => {
+    expect(checkFileLink('/w/proj/.env', '/w/proj')).toEqual({ ok: false, reason: 'sensitive' });
+  });
+
+  it('denies paths outside the workdir, boundary-safe', () => {
+    expect(checkFileLink('/w/proj-evil/a.js', '/w/proj')).toEqual({ ok: false, reason: 'outside-workdir' });
+    expect(checkFileLink('/etc/hosts', '/w/proj')).toEqual({ ok: false, reason: 'outside-workdir' });
+  });
+
+  it('allows the workdir itself and files under it', () => {
+    expect(checkFileLink('/w/proj/src/a.js', '/w/proj')).toEqual({ ok: true });
+    expect(checkFileLink('/w/proj', '/w/proj')).toEqual({ ok: true });
+  });
+
+  it('resolves relative segments before checking', () => {
+    expect(checkFileLink('/w/proj/src/../../other/a.js', '/w/proj')).toEqual({ ok: false, reason: 'outside-workdir' });
+  });
+
+  it('skips containment without a workdir but keeps the denylist', () => {
+    expect(checkFileLink('/anywhere/a.js', null)).toEqual({ ok: true });
+    expect(checkFileLink('/anywhere/.env', null)).toEqual({ ok: false, reason: 'sensitive' });
+  });
+});
+
+describe('validateAndOpen', () => {
+  let dir, outside;
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'flg-work-'));
+    outside = mkdtempSync(path.join(tmpdir(), 'flg-outside-'));
+    writeFileSync(path.join(dir, 'ok.txt'), 'hello guard\n');
+    writeFileSync(path.join(dir, '.env'), 'SECRET=1\n');
+    writeFileSync(path.join(outside, 'target.txt'), 'outside content\n');
+    symlinkSync(path.join(outside, 'target.txt'), path.join(dir, 'sneaky.txt'));
+    writeFileSync(path.join(outside, 'config.json'), '{"token":"x"}\n');
+    symlinkSync(path.join(outside, 'config.json'), path.join(dir, 'innocent.txt'));
+    writeFileSync(path.join(dir, 'big.txt'), 'x'.repeat(64));
+    mkdirSync(path.join(dir, 'sub'));
+  });
+  afterAll(() => {
+    for (const d of [dir, outside]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  const denied = async (p, opts) => {
+    try {
+      await validateAndOpen(p, opts);
+    } catch (err) {
+      expect(err).toBeInstanceOf(FileLinkDenied);
+      return err.reason;
+    }
+    throw new Error('expected FileLinkDenied');
+  };
+
+  it('returns content and realPath for a normal file in the workdir', async () => {
+    const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), { workdir: dir });
+    expect(content.toString('utf-8')).toBe('hello guard\n');
+    expect(path.basename(realPath)).toBe('ok.txt');
+  });
+
+  it('rejects a symlink at the final component', async () => {
+    expect(await denied(path.join(dir, 'sneaky.txt'), { workdir: dir })).toBe('symlink');
+  });
+
+  it('rejects a sensitive file', async () => {
+    expect(await denied(path.join(dir, '.env'), { workdir: dir })).toBe('sensitive');
+  });
+
+  it('rejects a file over maxBytes', async () => {
+    expect(await denied(path.join(dir, 'big.txt'), { workdir: dir, maxBytes: 16 })).toBe('too-large');
+  });
+
+  it('rejects a directory', async () => {
+    expect(await denied(path.join(dir, 'sub'), { workdir: dir })).toMatch(/not-a-file|unreadable/);
+  });
+
+  it('rejects a missing file', async () => {
+    expect(await denied(path.join(dir, 'nope.txt'), { workdir: dir })).toBe('unreadable');
+  });
+
+  it('rejects content outside the workdir even without a symlink', async () => {
+    expect(await denied(path.join(outside, 'target.txt'), { workdir: dir })).toBe('outside-workdir');
+  });
+
+  it('skips containment for legacy calls without a workdir', async () => {
+    const { content } = await validateAndOpen(path.join(outside, 'target.txt'), {});
+    expect(content.toString('utf-8')).toBe('outside content\n');
+  });
+
+  it('exports a 5MB default cap', () => {
+    expect(MAX_VIEW_BYTES).toBe(5 * 1024 * 1024);
+  });
+});
