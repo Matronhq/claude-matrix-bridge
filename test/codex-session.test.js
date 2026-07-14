@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -78,5 +79,49 @@ describe('Codex programmatic session', () => {
     expect(session.send([{ type: 'text', text: 'too soon' }])).toBe(false);
     expect(session.interrupt()).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGINT');
+  });
+
+  it('exposes a synchronous spawn failure before returning false', async () => {
+    const error = new Error('spawn codex ENOENT');
+    const session = new CodexExecSession({
+      cwd: '/repo',
+      spawnImpl: () => { throw error; },
+    });
+    const onSpawnError = vi.fn();
+    session.on('spawn-error', onSpawnError);
+
+    expect(session.send([{ type: 'text', text: 'go' }])).toBe(false);
+    expect(session.lastError).toBe(error);
+
+    await Promise.resolve();
+    expect(onSpawnError).toHaveBeenCalledWith(error);
+  });
+});
+
+describe('Codex bridge wiring', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+
+  it('reports rejected dispatches as failures and gates downstream work', () => {
+    const start = src.indexOf('function sendToSession(');
+    const end = src.indexOf('\nfunction sendTextToSession(', start);
+    const body = src.slice(start, end);
+
+    expect(body).toMatch(
+      /session\.agent === AGENT_CODEX[\s\S]*return reportSessionSendFailure\([\s\S]*const sent = session\.codex\?\.send/,
+    );
+    expect(body).toMatch(/if \(sent\) \{[\s\S]*commitDispatchedUserTurn/);
+    expect(body).toMatch(/if \(!sent\) \{[\s\S]*return reportSessionSendFailure/);
+    expect(src.match(/if \(!session\._sendFailureReported\)/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('refreshes the persisted native thread ID without replacing a stable journal ID', () => {
+    const start = src.indexOf('function handleCodexEvent(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+
+    expect(body).toContain('session.claudeSessionId !== event.thread_id');
+    expect(body).toContain('session.claudeSessionId = event.thread_id');
+    expect(body).toContain('if (!session.journalConvoId) session.journalConvoId = event.thread_id');
+    expect(body).toContain('persistSession(session.roomId, event.thread_id');
   });
 });

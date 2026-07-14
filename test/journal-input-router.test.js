@@ -622,6 +622,17 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(hBody).toMatch(/skipJournalMirror = false/);
     expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
   });
+
+  it('resumes the active provider with its provider-specific native session ID', () => {
+    const start = src.indexOf('function resumePersistedSession(');
+    const end = src.indexOf('\n// --- Matrix Message Handler ---', start);
+    const body = src.slice(start, end);
+
+    expect(body).toContain('const resumeSessionId = activeState.sessionId;');
+    expect(body).toMatch(/createSession\(roomId, prev\.workdir \|\| DEFAULT_WORKDIR, resumeSessionId,/);
+    expect(body).toContain('if (resumeSessionId) enterResumeHold(newSession);');
+    expect(body).not.toMatch(/createSession\([^\n]+prev\.sessionId/);
+  });
 });
 
 // The payload classifier behind the issue #98 fix. Option IDs are

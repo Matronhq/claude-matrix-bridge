@@ -1283,15 +1283,19 @@ function handleCodexEvent(session, event) {
   switch (event?.type) {
     case 'thread.started': {
       if (!event.thread_id) break;
-      if (!session.claudeSessionId) {
+      const nativeIdChanged = session.claudeSessionId !== event.thread_id;
+      const journalIdMissing = !session.journalConvoId;
+      if (nativeIdChanged || journalIdMissing) {
         session.claudeSessionId = event.thread_id;
         if (!session.journalConvoId) session.journalConvoId = event.thread_id;
         persistSession(session.roomId, event.thread_id, session.workdir, session.originRoomId, {
           chatHistory: session.chatHistory,
           model: session.currentModel || null,
         });
-        console.log(`Captured Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
-        journalFlushForSession(session);
+        if (nativeIdChanged) {
+          console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
+        }
+        if (journalIdMissing) journalFlushForSession(session);
       }
       break;
     }
@@ -3270,6 +3274,27 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
   }
 }
 
+function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
+  session.busy = false;
+  if (restoreJournalState) {
+    journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
+  }
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+    client.setTyping(session.roomId, false, 1000).catch(() => {});
+  }
+  // Callers use false to decide whether dispatch-dependent work (history,
+  // media mirroring, naming) may run. Remember that the specific failure was
+  // already shown so the Matrix handler does not add its generic dead-session
+  // fallback on top.
+  session._sendFailureReported = true;
+  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+  else if (session.sendCallback) session.sendCallback(message);
+  return false;
+}
+
 function flushResponse(session) {
   let text = session.responseBuffer.trim();
   session.responseBuffer = '';
@@ -3324,6 +3349,7 @@ function flushResponse(session) {
 // (Matrix messages, which have no other route into the journal) leaves this
 // false, unchanged from before.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
+  session._sendFailureReported = false;
   if (!session.alive || session._autoStopped) return false;
 
   // Resume-hold gate: while a just-resumed iv session isn't input-ready yet,
@@ -3341,26 +3367,39 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     return true;
   }
 
-  session.lastActivityAt = Date.now();
-  session.responseBuffer = '';
-  session.toolCalls = [];
-  session.busy = true;
-  journalSessionState(session, 'running');
-  journalActivity(session, 'thinking');
-  // Mirror the user's side of the conversation into the journal. This is the
-  // single choke point every real inbound message flows through (directly for
-  // media, via sendTextToSession for plain text), so a message is mirrored
-  // exactly once here regardless of caller.
-  if (!skipJournalMirror) {
-    const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
-    if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
-  }
   const historyText = contentBlocks
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text)
     .filter(Boolean)
     .join('\n\n')
     .trim();
+  const journalText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n\n')
+    .trim();
+
+  // Reject unsupported Codex inputs before changing activity state or
+  // journaling them. A false return is important: callers gate chat history,
+  // media mirroring, and first-message naming on actual dispatch.
+  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
+    return reportSessionSendFailure(
+      session,
+      'Codex programmatic mode needs a text prompt or a saved-file path.',
+    );
+  }
+
+  session.lastActivityAt = Date.now();
+  session.responseBuffer = '';
+  session.toolCalls = [];
+  session.busy = true;
+  journalSessionState(session, 'running');
+  journalActivity(session, 'thinking');
+  // Mirror Claude input here. Codex input is mirrored below only after its
+  // one-process-per-turn adapter confirms that it accepted the dispatch.
+  if (!skipJournalMirror && session.agent !== AGENT_CODEX && journalText) {
+    journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
+  }
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
@@ -3387,31 +3426,21 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     // codex exec accepts one text prompt per process. Media builders always
     // include an absolute-path text annotation; binary/base64 blocks are
     // intentionally omitted here because Codex can inspect the saved file.
-    if (!historyText || !contentBlocksToCodexPrompt(contentBlocks)) {
-      session.busy = false;
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
-      }
-      const message = "Codex programmatic mode needs a text prompt or a saved-file path.";
-      if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-      else if (session.sendCallback) session.sendCallback(message);
-      return true;
-    }
     const sent = session.codex?.send(contentBlocks) === true;
-    if (sent) commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
-    if (!sent) {
-      session.busy = false;
-      journalSessionState(session, 'waiting');
-      journalActivity(session, 'idle');
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
+    if (sent) {
+      commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
+      if (!skipJournalMirror && journalText) {
+        journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
       }
     }
-    return sent;
+    if (!sent) {
+      const detail = session.codex?.lastError?.message || session._codexLastError;
+      const message = detail
+        ? `Could not start Codex: ${detail}`
+        : 'Codex could not accept the message. Try again or restart the session.';
+      return reportSessionSendFailure(session, message, { restoreJournalState: true });
+    }
+    return true;
   }
 
   if (session.iv) {
@@ -6186,13 +6215,14 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
   const activeState = getPersistedAgentState(prev, activeAgent, history.length);
-  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId, {
+  const resumeSessionId = activeState.sessionId;
+  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, resumeSessionId, {
     agent: activeAgent,
-    model: activeState.model || prev.model,
+    model: activeState.model,
     interactive: activeAgent === AGENT_CLAUDE
-      ? (activeState.interactiveMode ?? prev.interactiveMode)
+      ? activeState.interactiveMode
       : undefined,
-    mcpExtras: activeState.mcpExtras.length ? activeState.mcpExtras : prev.mcpExtras,
+    mcpExtras: activeState.mcpExtras,
     journalConvoId: prev.journalConvoId,
   });
   newSession.originRoomId = prev.originRoomId || null;
@@ -6206,14 +6236,14 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
     sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
   hydrateAgentState(newSession, prev);
 
-  const shortId = prev.sessionId ? prev.sessionId.slice(0, 8) : 'new';
-  const verb = prev.sessionId ? 'Auto-resuming' : 'Restoring';
+  const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
+  const verb = resumeSessionId ? 'Auto-resuming' : 'Restoring';
   const arNotice = notice('info', `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, `${verb} ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
   Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
-  if (prev.sessionId) enterResumeHold(newSession);
+  if (resumeSessionId) enterResumeHold(newSession);
   return newSession;
 }
 
@@ -6659,7 +6689,9 @@ client.on('room.message', async (roomId, event) => {
       }
 
       if (!sendToSession(session, blocks)) {
-        await sendReply('Session is not available. Send !start to begin a new one.');
+        if (!session._sendFailureReported) {
+          await sendReply('Session is not available. Send !start to begin a new one.');
+        }
       } else {
         // Media journal mirror (upload + publish + markRead) happens here,
         // at actual dispatch, not at buildMediaContentBlocks build time —
@@ -6679,7 +6711,9 @@ client.on('room.message', async (roomId, event) => {
     }
   } else {
     if (!sendTextToSession(session, text)) {
-      await sendReply('Session is not available. Send !start to begin a new one.');
+      if (!session._sendFailureReported) {
+        await sendReply('Session is not available. Send !start to begin a new one.');
+      }
     } else {
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
