@@ -328,6 +328,8 @@ describe('index.js resume/sessions paths — no sync fs calls (source inspection
 
     expect(block).toContain('findPersistedAgentSession(selectedAgent, resumeSessionId)');
     expect(block).not.toMatch(/Object\.values\(loadPersistedSessions\(\)\)\.find\(e => e\.sessionId/);
+    expect(block).toContain('codexMatches.length + claudeMatches.size > 1');
+    expect(block).toContain('await rejectAmbiguousResume()');
     expect(block).toContain('journalConvoIdFor(activeSession) === resumeConvoId');
     expect(block).toContain('agentSessions: inheritedAgentSessions');
     expect(block).toContain('journalConvoId: resumePersisted?.journalConvoId');

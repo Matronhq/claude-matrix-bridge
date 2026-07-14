@@ -3,6 +3,7 @@ import {
   buildAgentHandoffPrompt,
   canSwitchAgent,
   getPersistedAgentState,
+  matchSessionIdPrefix,
   mergeAgentStates,
   normalizeHistoryCursor,
   prependHandoffPrompt,
@@ -114,6 +115,26 @@ describe('agent handoff persistence', () => {
     expect(normalizeHistoryCursor(-5, 3)).toBe(0);
     expect(normalizeHistoryCursor(9, 3)).toBe(3);
     expect(normalizeHistoryCursor(undefined, 3)).toBe(0);
+  });
+});
+
+describe('matchSessionIdPrefix', () => {
+  it('returns one exact candidate from session objects or string IDs', () => {
+    expect(matchSessionIdPrefix([
+      { sessionId: 'claude-123' },
+      { sessionId: 'claude-456' },
+    ], 'claude-1')).toMatchObject({
+      match: { sessionId: 'claude-123' },
+      ambiguous: false,
+    });
+    expect(matchSessionIdPrefix(['codex-123'], 'codex').match).toBe('codex-123');
+  });
+
+  it('marks non-unique prefixes as ambiguous instead of choosing one', () => {
+    const result = matchSessionIdPrefix(['shared-1', 'shared-2'], 'shared');
+    expect(result.match).toBeNull();
+    expect(result.matches).toEqual(['shared-1', 'shared-2']);
+    expect(result.ambiguous).toBe(true);
   });
 });
 

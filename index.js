@@ -70,6 +70,7 @@ import {
   buildAgentHandoffPrompt,
   canSwitchAgent,
   getPersistedAgentState,
+  matchSessionIdPrefix,
   mergeAgentStates,
   normalizeHistoryCursor,
   otherAgent,
@@ -4804,17 +4805,43 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         fallback: DEFAULT_AGENT,
       });
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
+      const rejectAmbiguousResume = async () => {
+        await sendReply(
+          `Session prefix ${resumeArg} matches multiple sessions. Use a longer ID and specify --claude or --codex.`,
+        );
+      };
 
       // An explicit ID prefix can identify a persisted Codex thread even
       // when the caller omitted --codex. Numeric selection remains scoped to
       // the selected/default agent because numbers are list-relative.
       if (!resumeAgentFlags.agent && isNaN(num)) {
-        const codexMatch = listPersistedAgentSessions(AGENT_CODEX)
-          .find(entry => entry.sessionId.startsWith(resumeArg));
-        const claudeMatch = listPersistedAgentSessions(AGENT_CLAUDE)
-          .find(entry => entry.sessionId.startsWith(resumeArg));
-        if (codexMatch && !claudeMatch) selectedAgent = AGENT_CODEX;
-        else if (claudeMatch && !codexMatch) selectedAgent = AGENT_CLAUDE;
+        const codexMatches = matchSessionIdPrefix(
+          listPersistedAgentSessions(AGENT_CODEX),
+          resumeArg,
+        ).matches;
+        const persistedClaudeMatches = matchSessionIdPrefix(
+          listPersistedAgentSessions(AGENT_CLAUDE),
+          resumeArg,
+        ).matches;
+        const inferredClaudeDir = path.join(
+          os.homedir(),
+          '.claude',
+          'projects',
+          resumeWorkdir.replace(/\//g, '-'),
+        );
+        const localClaudeMatches = await pathExists(inferredClaudeDir)
+          ? matchSessionIdPrefix(await listSessionIdsByMtime(inferredClaudeDir), resumeArg).matches
+          : [];
+        const claudeMatches = new Set([
+          ...localClaudeMatches,
+          ...persistedClaudeMatches.map(entry => entry.sessionId),
+        ]);
+        if (codexMatches.length + claudeMatches.size > 1) {
+          await rejectAmbiguousResume();
+          return;
+        }
+        if (codexMatches.length === 1) selectedAgent = AGENT_CODEX;
+        else if (claudeMatches.size === 1) selectedAgent = AGENT_CLAUDE;
       }
 
       if (selectedAgent === AGENT_CODEX) {
@@ -4823,11 +4850,22 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           return;
         }
         const localEntries = listPersistedAgentSessions(AGENT_CODEX, resumeWorkdir);
-        if (!isNaN(num) && num >= 1 && num <= localEntries.length) {
+        if (!isNaN(num)) {
+          if (num < 1 || num > localEntries.length) {
+            await sendReply(`Codex session number not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
+            return;
+          }
           resumePersisted = localEntries[num - 1];
         } else {
-          resumePersisted = localEntries.find(entry => entry.sessionId.startsWith(resumeArg)) ||
-            listPersistedAgentSessions(AGENT_CODEX).find(entry => entry.sessionId.startsWith(resumeArg));
+          const resolution = matchSessionIdPrefix(
+            listPersistedAgentSessions(AGENT_CODEX),
+            resumeArg,
+          );
+          if (resolution.ambiguous) {
+            await rejectAmbiguousResume();
+            return;
+          }
+          resumePersisted = resolution.match;
         }
         if (!resumePersisted) {
           await sendReply(`Codex session not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
@@ -4839,40 +4877,52 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const encodedPath = resumeWorkdir.replace(/\//g, '-');
         const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-        if (!(await pathExists(projectDir))) {
-          await sendReply(`No Claude sessions directory found for workdir: ${resumeWorkdir}`);
-          return;
-        }
-
         // Async id resolution (issue #102): metadata is statted once per
         // transcript and sorted without synchronous work in the comparator.
-        const files = await listSessionIdsByMtime(projectDir);
-        if (!isNaN(num) && num >= 1 && num <= files.length) {
+        // A missing current-workdir directory is not terminal for an ID
+        // lookup: bridge persistence may point to the transcript's original
+        // workdir. Numeric selections remain scoped to the current workdir.
+        const files = await pathExists(projectDir)
+          ? await listSessionIdsByMtime(projectDir)
+          : [];
+        if (!isNaN(num)) {
+          if (num < 1 || num > files.length) {
+            await sendReply(`Claude session number not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
+            return;
+          }
           resumeSessionId = files[num - 1];
         } else {
-          const match = files.find(f => f.startsWith(resumeArg));
-          if (match) {
-            resumeSessionId = match;
-          } else {
-            // Session not found in current workdir — check persisted Claude
-            // sessions for a different workdir.
-            const foundEntry = listPersistedAgentSessions(AGENT_CLAUDE)
-              .find(entry => entry.sessionId.startsWith(resumeArg)
-                && entry.workdir && entry.workdir !== resumeWorkdir) || null;
-            if (foundEntry) {
-              const altEncoded = foundEntry.workdir.replace(/\//g, '-');
-              const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
-              const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-              if (await pathExists(altFile)) {
-                resumeSessionId = foundEntry.sessionId;
-                actualWorkdir = foundEntry.workdir;
-                resumePersisted = foundEntry;
-              }
+          const currentMatches = matchSessionIdPrefix(files, resumeArg).matches;
+          const persistedMatches = matchSessionIdPrefix(
+            listPersistedAgentSessions(AGENT_CLAUDE),
+            resumeArg,
+          ).matches;
+          const candidateIds = new Set([
+            ...currentMatches,
+            ...persistedMatches.map(entry => entry.sessionId),
+          ]);
+          if (candidateIds.size > 1) {
+            await rejectAmbiguousResume();
+            return;
+          }
+          const matchId = [...candidateIds][0] || null;
+          const foundEntry = persistedMatches.find(entry => entry.sessionId === matchId) || null;
+          if (matchId && currentMatches.includes(matchId)) {
+            resumeSessionId = matchId;
+            resumePersisted = foundEntry;
+          } else if (matchId && foundEntry?.workdir) {
+            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+            const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
+            const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
+            if (await pathExists(altFile)) {
+              resumeSessionId = foundEntry.sessionId;
+              actualWorkdir = foundEntry.workdir;
+              resumePersisted = foundEntry;
             }
-            if (!resumeSessionId) {
-              await sendReply(`Claude session not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
-              return;
-            }
+          }
+          if (!resumeSessionId) {
+            await sendReply(`Claude session not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
+            return;
           }
         }
       }
