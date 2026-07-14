@@ -124,4 +124,18 @@ describe('Codex bridge wiring', () => {
     expect(body).toContain('if (!session.journalConvoId) session.journalConvoId = event.thread_id');
     expect(body).toContain('persistSession(session.roomId, event.thread_id');
   });
+
+  it('rejects media-only interactive turns before buffering or applying a handoff', () => {
+    const start = src.indexOf('function sendToSession(');
+    const end = src.indexOf('\nfunction sendTextToSession(', start);
+    const body = src.slice(start, end);
+    const validation = body.indexOf('if (session.iv && !historyText)');
+    const resumeHold = body.indexOf('if (session._awaitingInputReady)');
+    const handoff = body.indexOf('applyPendingAgentHandoff(session, contentBlocks)');
+
+    expect(validation).toBeGreaterThan(-1);
+    expect(validation).toBeLessThan(resumeHold);
+    expect(validation).toBeLessThan(handoff);
+    expect(body.slice(validation, resumeHold)).toContain('return reportSessionSendFailure');
+  });
 });

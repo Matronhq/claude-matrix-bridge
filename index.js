@@ -3366,6 +3366,40 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session._sendFailureReported = false;
   if (!session.alive || session._autoStopped) return false;
 
+  const historyText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  const journalText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n\n')
+    .trim();
+
+  // Interactive PTY input cannot deliver non-text-only turns. Reject before
+  // the resume outbox and, crucially, before prepending a pending provider
+  // handoff; otherwise the synthetic handoff becomes the only sendable text,
+  // is consumed as a standalone turn, and the user's attachment is dropped.
+  if (session.iv && !historyText) {
+    const nonTextCount = contentBlocks.filter(block => block?.type !== 'text').length;
+    const message = nonTextCount > 0
+      ? `Can't send ${nonTextCount} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`
+      : 'Interactive mode needs a text prompt.';
+    return reportSessionSendFailure(session, message);
+  }
+
+  // Reject unsupported Codex inputs before changing activity state or
+  // journaling them. A false return is important: callers gate chat history,
+  // media mirroring, and first-message naming on actual dispatch.
+  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
+    return reportSessionSendFailure(
+      session,
+      'Codex programmatic mode needs a text prompt or a saved-file path.',
+    );
+  }
+
   // Resume-hold gate: while a just-resumed iv session isn't input-ready yet,
   // buffer outgoing messages instead of typing them into the still-loading
   // TUI. The readiness watcher (startResumeReadyWatcher) flushes them, merged
@@ -3379,28 +3413,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     (session._resumeOutbox ||= []).push(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks);
     session.lastActivityAt = Date.now();
     return true;
-  }
-
-  const historyText = contentBlocks
-    .filter(block => block?.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text)
-    .filter(Boolean)
-    .join('\n\n')
-    .trim();
-  const journalText = contentBlocks
-    .filter(block => block?.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text)
-    .join('\n\n')
-    .trim();
-
-  // Reject unsupported Codex inputs before changing activity state or
-  // journaling them. A false return is important: callers gate chat history,
-  // media mirroring, and first-message naming on actual dispatch.
-  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
-    return reportSessionSendFailure(
-      session,
-      'Codex programmatic mode needs a text prompt or a saved-file path.',
-    );
   }
 
   session.lastActivityAt = Date.now();
@@ -3474,23 +3486,14 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }
-    // Nothing to send (all blocks were non-text and got dropped). Don't
-    // leave the session in `busy=true` with a stuck typing indicator —
-    // no claude turn means no Stop hook to clear them.
-    session.busy = false;
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
-    }
-    // Tell the user what happened directly. Returning true so the caller's
-    // generic "Session is not available" fallback doesn't fire — the
-    // session IS alive, we just can't forward non-text content through the
-    // PTY yet (Phase 6 will add image handling via a side channel).
-    const msg = `Can't send ${nonText.length} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`;
-    if (session.sendHtml) session.sendHtml(msg, escapeHtml(msg));
-    else if (session.sendCallback) session.sendCallback(msg);
-    return true;
+    // Defensive fallback: validation above should make this unreachable, but
+    // preserve false/handled semantics if a future content rewrite removes
+    // all text after activity state has started.
+    return reportSessionSendFailure(
+      session,
+      'Interactive mode needs a text prompt.',
+      { restoreJournalState: true },
+    );
   }
 
   const jsonMsg = JSON.stringify({
