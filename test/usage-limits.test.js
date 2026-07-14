@@ -16,6 +16,19 @@ Last 24h · 1732 requests · 3 sessions
   74% of your usage was at >150k context
 `;
 
+// Real output from the same command after claude switched the reset text to
+// "at" + the machine's IANA zone (captured 2026-07-14 on a Europe/London
+// machine, during BST = UTC+1).
+const LOCAL_ZONE_SAMPLE = `You are currently using your subscription to power your Claude Code usage
+
+Current session: 23% used · resets Jul 15 at 12:19am (Europe/London)
+Current week (all models): 13% used · resets Jul 20 at 9:59pm (Europe/London)
+Current week (Fable): 21% used · resets Jul 20 at 9:59pm (Europe/London)
+
+What's contributing to your limits usage?
+Approximate, based on local sessions on this machine — does not include other devices or claude.ai.
+`;
+
 const GREEN = '#3fb950';
 const ORANGE = '#f0883e';
 const RED = '#f85149';
@@ -64,6 +77,17 @@ describe('parseUsageLimits', () => {
     const { lines } = parseUsageLimits('Current session: 39% used · resets soon\n');
     expect(lines).toHaveLength(1);
     expect('resets_at' in lines[0]).toBe(false);
+  });
+
+  it('parses the "at" + local IANA zone format to UTC timestamps', () => {
+    const { ok, lines } = parseUsageLimits(LOCAL_ZONE_SAMPLE, new Date('2026-07-14T22:00:00Z'));
+    expect(ok).toBe(true);
+    expect(lines).toEqual([
+      // BST is UTC+1: 12:19am Jul 15 London = 11:19pm Jul 14 UTC.
+      { label: 'Session', percent: 23, resets: 'Jul 15 at 12:19am (Europe/London)', resets_at: '2026-07-14T23:19:00.000Z' },
+      { label: 'Week (all models)', percent: 13, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
+      { label: 'Week (Fable)', percent: 21, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
+    ]);
   });
 });
 
@@ -114,6 +138,37 @@ describe('parseResetsAt', () => {
   it('fails open when the date is beyond the 8-day future horizon', () => {
     expect(parseResetsAt('Jul 20, 12:00pm (UTC)', new Date('2026-07-01T00:00:00Z')))
       .toBeNull();
+  });
+
+  it('parses the "at" separator with a UTC zone', () => {
+    expect(parseResetsAt('Jul 9 at 12:59am (UTC)', now)).toBe('2026-07-09T00:59:00.000Z');
+  });
+
+  it('converts a summer-time IANA zone to UTC (BST = UTC+1)', () => {
+    expect(parseResetsAt('Jul 15 at 12:19am (Europe/London)', new Date('2026-07-14T22:00:00Z')))
+      .toBe('2026-07-14T23:19:00.000Z');
+  });
+
+  it('converts the same zone in winter without the DST offset (GMT)', () => {
+    expect(parseResetsAt('Jan 10 at 3:00pm (Europe/London)', new Date('2027-01-10T00:00:00Z')))
+      .toBe('2027-01-10T15:00:00.000Z');
+  });
+
+  it('converts a US zone across the date line to the right UTC day', () => {
+    // EDT is UTC-4: 12:19am Jul 15 New York = 4:19am Jul 15 UTC.
+    expect(parseResetsAt('Jul 15 at 12:19am (America/New_York)', new Date('2026-07-14T22:00:00Z')))
+      .toBe('2026-07-15T04:19:00.000Z');
+  });
+
+  it('rolls the year correctly for a zoned Dec->Jan reset', () => {
+    // GMT in winter: 12:59am Jan 1 London = 12:59am Jan 1 UTC, next year.
+    expect(parseResetsAt('Jan 1 at 12:59am (Europe/London)', new Date('2026-12-31T12:00:00Z')))
+      .toBe('2027-01-01T00:59:00.000Z');
+  });
+
+  it('fails open on zone names Intl rejects or legacy abbreviations', () => {
+    expect(parseResetsAt('Jul 9 at 12:59am (Not/AZone)', now)).toBeNull();
+    expect(parseResetsAt('Jul 9 at 12:59am (BST)', now)).toBeNull();
   });
 });
 
