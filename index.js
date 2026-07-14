@@ -3273,6 +3273,15 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
   const toolUseId = entry.messageRef;
   (async () => {
     try {
+      // Bounded final flush BEFORE the durable finalize publish below: bytes
+      // written after stop()'s last pass (stop() is synchronous and never
+      // flushes — see lib/tool-stream-pump.js) never streamed as live
+      // appends. Must be awaited HERE, in this order: the server frees the
+      // stream buffer on finalize, so a stream_append arriving after
+      // finalize would recreate a zombie buffer. Code order — not timing —
+      // is what guarantees flush-then-finalize. flushFinal never throws.
+      await entry.pump.flushFinal();
+
       let logBuf = null;
       try {
         logBuf = await fs.promises.readFile(entry.logPath);

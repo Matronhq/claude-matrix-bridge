@@ -295,6 +295,54 @@ describe('createToolStreamPump', () => {
     }
   });
 
+  it('flushFinal() publishes tail bytes written after stop(), byte-exact', async () => {
+    const { logPath, sink, pump, cleanup } = setup({ preContent: 'aa', throttleMs: 0 });
+    try {
+      pump.start();
+      await waitFor(() => sink.content() === 'aa');
+      appendFileSync(logPath, 'bb');
+      pump.stop(); // synchronous — the watcher's async notification for 'bb' can't have fired yet
+      expect(sink.content()).toBe('aa'); // confirms the write hasn't streamed as a live append
+      await pump.flushFinal();
+      expect(sink.content()).toBe('aabb');
+      const last = sink.frames[sink.frames.length - 1];
+      expect(last.offset).toBe(2);
+      expect(last.chunk).toBe('bb');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('flushFinal(maxBytes) honors the cap when the un-flushed tail exceeds it', async () => {
+    const { logPath, sink, pump, cleanup } = setup({ preContent: 'a', throttleMs: 0 });
+    try {
+      pump.start();
+      await waitFor(() => sink.content() === 'a');
+      appendFileSync(logPath, 'x'.repeat(200));
+      pump.stop();
+      expect(sink.content()).toBe('a');
+      await pump.flushFinal(50);
+      // Capped: only 50 of the 200 un-flushed bytes went out, not the whole tail.
+      expect(Buffer.byteLength(sink.content())).toBe(1 + 50);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('flushFinal() is safe to call on a pump with nothing left to flush (no-op)', async () => {
+    const { sink, pump, cleanup } = setup({ preContent: 'done' });
+    try {
+      pump.start();
+      await waitFor(() => sink.content() === 'done');
+      pump.stop();
+      const framesBefore = sink.frames.length;
+      await expect(pump.flushFinal()).resolves.toBeUndefined();
+      expect(sink.frames.length).toBe(framesBefore);
+    } finally {
+      cleanup();
+    }
+  });
+
   it('clamps chunkBytes below 4 to prevent permanent stall on multi-byte splits', async () => {
     // Pass chunkBytes: 1 (narrower than any UTF-8 character); the clamping logic
     // must enforce a minimum of 4. Content 'aé' is 3 bytes (a=1, é=2), so even
