@@ -1252,7 +1252,17 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   });
   codex.on('turn-exit', ({ code, signal, stderr, sawTurnCompleted }) => {
     session.proc = null;
-    if (!session.alive || session._codexTurnFinished) return;
+    if (session._codexTurnFinished) return;
+    if (!session.alive) {
+      // killSession normally performs this synchronously so a replacement
+      // session cannot inherit running/thinking state. Keep an exit-side
+      // fallback for any future path that marks the session dead directly.
+      finishCodexTurn(session, {
+        usage: session._codexCompletedUsage,
+        discardOutput: true,
+      });
+      return;
+    }
     const interrupted = session._codexInterrupted;
     session._codexInterrupted = false;
     if (interrupted) {
@@ -1361,7 +1371,29 @@ function handleCodexEvent(session, event) {
   }
 }
 
-function finishCodexTurn(session, { error = null, usage = null } = {}) {
+function flushPendingSessionQueue(session) {
+  if (!session.alive || !session.queuedMessages?.length) return false;
+  const queued = session.queuedMessages;
+  session.queuedMessages = null;
+  const summary = formatQueueSummary(queued);
+  if (session.sendHtml) {
+    session.sendHtml(
+      `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
+      `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
+    );
+  } else if (session.sendCallback) {
+    session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+  }
+  flushQueue(session, queued);
+  return true;
+}
+
+function finishCodexTurn(session, {
+  error = null,
+  usage = null,
+  discardOutput = false,
+  preserveQueue = false,
+} = {}) {
   if (session._codexTurnFinished) return;
   session._codexTurnFinished = true;
   session.turnCount++;
@@ -1372,17 +1404,21 @@ function finishCodexTurn(session, { error = null, usage = null } = {}) {
     session.totalUsage.cache_read += usage.cached_input_tokens || 0;
   }
 
-  if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
-    for (const chunk of splitMessage(session.toolCalls.join('\n'))) session.sendCallback(chunk);
+  if (!discardOutput) {
+    if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+      for (const chunk of splitMessage(session.toolCalls.join('\n'))) session.sendCallback(chunk);
+    }
+    flushResponse(session);
+  } else {
+    session.responseBuffer = '';
   }
   session.toolCalls = [];
-  flushResponse(session);
   journalStreamClear(session);
   session.busy = false;
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   journalStatus(session);
-  stripQueueNotificationLinks(session);
+  if (!preserveQueue) stripQueueNotificationLinks(session);
 
   if (session.typingInterval) {
     clearInterval(session.typingInterval);
@@ -1390,26 +1426,13 @@ function finishCodexTurn(session, { error = null, usage = null } = {}) {
     client.setTyping(session.roomId, false, 1000).catch(() => {});
   }
 
-  if (error && session.alive) {
+  if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
     if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
     else if (session.sendCallback) session.sendCallback(message);
   }
 
-  if (session.alive && session.queuedMessages?.length) {
-    const queued = session.queuedMessages;
-    session.queuedMessages = null;
-    const summary = formatQueueSummary(queued);
-    if (session.sendHtml) {
-      session.sendHtml(
-        `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
-        `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
-      );
-    } else if (session.sendCallback) {
-      session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
-    }
-    flushQueue(session, queued);
-  }
+  if (!preserveQueue) flushPendingSessionQueue(session);
 }
 
 // --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
@@ -4717,6 +4740,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       killSession(session);
       sessions.delete(roomId);
+      journalSessionState(session, 'done');
+      journalActivity(session, 'idle');
       journalEvictConvoInput(session);
       // Append [done] to the session room name
       try {
@@ -7570,7 +7595,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // _journalDurableRef, so a late flush on the old session can't carry a stale
   // ref onto the new session's journal. No-op when nothing was streaming.
   journalStreamClear(existing);
-  killSession(existing);
+  killSession(existing, 'SIGTERM', { preserveQueue: true });
   const next = createSession(roomId, workdir, sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
@@ -7617,6 +7642,13 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // still-loading TUI and dropped. No-op for print sessions (enterResumeHold
   // returns early when there's no PTY).
   enterResumeHold(next);
+  // A forced Codex restart may have interrupted a turn with user messages
+  // already queued behind it. They belong to the logical conversation, not
+  // the killed child, so dispatch them through the idle replacement now.
+  if (next.agent === AGENT_CODEX && next.queuedMessages?.length) {
+    stripQueueNotificationLinks(next);
+    flushPendingSessionQueue(next);
+  }
   return next;
 }
 
@@ -7688,7 +7720,7 @@ function clearPendingInterrupt(session) {
   }
 }
 
-function killSession(session, signal = 'SIGTERM') {
+function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
@@ -7709,7 +7741,20 @@ function killSession(session, signal = 'SIGTERM') {
   if (!session.alive) return;
   try {
     session.alive = false;
-    if (session.agent === AGENT_CODEX && session.codex) session.codex.kill(signal);
+    if (session.agent === AGENT_CODEX && session.codex) {
+      // Codex's adapter has no long-lived idle process whose close handler can
+      // normalize bridge state. Finish an active turn synchronously before a
+      // restart copies state into its replacement; discard partial output and
+      // never flush queued work into a session being killed.
+      if (!session._codexTurnFinished) {
+        finishCodexTurn(session, {
+          usage: session._codexCompletedUsage,
+          discardOutput: true,
+          preserveQueue,
+        });
+      }
+      session.codex.kill(signal);
+    }
     else if (session.iv) session.iv.kill(signal);
     else if (session.proc) session.proc.kill(signal);
   } catch (e) {

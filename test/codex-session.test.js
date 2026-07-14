@@ -138,4 +138,25 @@ describe('Codex bridge wiring', () => {
     expect(validation).toBeLessThan(handoff);
     expect(body.slice(validation, resumeHold)).toContain('return reportSessionSendFailure');
   });
+
+  it('finishes killed Codex turns without flushing partial output or queued work', () => {
+    const exitStart = src.indexOf("codex.on('turn-exit'");
+    const exitEnd = src.indexOf('\n  });', exitStart) + 6;
+    const exitBody = src.slice(exitStart, exitEnd);
+    expect(exitBody).not.toContain('!session.alive || session._codexTurnFinished');
+    expect(exitBody).toContain('discardOutput: true');
+
+    const killStart = src.indexOf('function killSession(');
+    const killEnd = src.indexOf('\nfunction ', killStart + 1);
+    const killBody = src.slice(killStart, killEnd);
+    expect(killBody).toContain('finishCodexTurn(session');
+    expect(killBody).toContain('preserveQueue');
+    expect(killBody.indexOf('finishCodexTurn(session')).toBeLessThan(killBody.indexOf('session.codex.kill(signal)'));
+
+    const recreateStart = src.indexOf('function recreateSession(');
+    const recreateEnd = src.indexOf('\nfunction ', recreateStart + 1);
+    const recreateBody = src.slice(recreateStart, recreateEnd);
+    expect(recreateBody).toContain("killSession(existing, 'SIGTERM', { preserveQueue: true })");
+    expect(recreateBody).toContain('flushPendingSessionQueue(next)');
+  });
 });
