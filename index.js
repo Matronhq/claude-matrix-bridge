@@ -2510,6 +2510,7 @@ function handleClaudeEvent(session, event) {
             // unrelated event cleared it. No-op when nothing was streaming.
             journalStreamClear(session);
             session.busy = false;
+            clearPendingInterrupt(session);
           }
         }
       }
