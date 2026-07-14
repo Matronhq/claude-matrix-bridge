@@ -14,6 +14,7 @@ function makeRouter(overrides = {}) {
     buildSavedBlocks: vi.fn(() => [{ type: 'text', text: 'File saved to /w/report.pdf' }]),
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
+    queueMedia: vi.fn(async () => {}),
     echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
     escapeHtml: (s) => String(s),
@@ -137,5 +138,56 @@ describe('createJournalMediaRouter — audio (voice note)', () => {
     await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg' }, ctx);
     expect(deps.injectText).not.toHaveBeenCalled();
     expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/transcribe/));
+  });
+});
+
+describe('createJournalMediaRouter — busy session queues instead of injecting', () => {
+  const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
+
+  it('a busy session QUEUES a saved file (mirrorToJournal:false), never injects it', async () => {
+    const { route, deps } = makeRouter();
+    await route(busySession, { type: 'file', blobRef: 'blob-1', contentType: 'application/pdf', name: 'report.pdf' }, ctx);
+
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1); // built eagerly
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    const [sess, entry] = deps.queueMedia.mock.calls[0];
+    expect(sess).toBe(busySession);
+    expect(entry).toMatchObject({
+      blocks: [{ type: 'text', text: 'File saved to /w/report.pdf' }],
+      mirrorToJournal: false,
+      preview: 'report.pdf',
+    });
+  });
+
+  it('a busy session QUEUES a voice-note transcript (mirrorToJournal:true), never injects it', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('ogg'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => 'buy milk'),
+    });
+    await route(busySession, { type: 'file', blobRef: 'voice-1', contentType: 'audio/ogg', name: 'voice.ogg' }, ctx);
+
+    expect(deps.transcribe).toHaveBeenCalledTimes(1); // transcribed eagerly
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    const [, entry] = deps.queueMedia.mock.calls[0];
+    expect(entry).toMatchObject({
+      blocks: [{ type: 'text', text: '[Voice note transcription]: buy milk' }],
+      mirrorToJournal: true,
+      preview: '🎤 buy milk',
+    });
+  });
+
+  it('falls back to immediate injection when busy but no queueMedia seam is wired', async () => {
+    const { route, deps } = makeRouter({ queueMedia: undefined });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  it('an idle session still injects immediately (queueMedia untouched)', async () => {
+    const { route, deps } = makeRouter();
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.queueMedia).not.toHaveBeenCalled();
   });
 });

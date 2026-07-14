@@ -5261,11 +5261,41 @@ const journalMediaRouter = createJournalMediaRouter({
   },
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  queueMedia: (session, entry) => journalQueueMedia(session, entry),
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
   log: console,
 });
+
+// Queue a prepared media injection while the session is busy — the media
+// counterpart of the journal text busy-queue branch (journalRouteTextToSession)
+// and the Matrix busy media branch (room.message handler). Pushes the
+// already-fetched/built blocks onto the SAME session.queuedMessages a Matrix or
+// journal-text message uses (never a second queue), so the shared flushQueue
+// (one merged sendToSession at turn end) delivers them in arrival order with any
+// interleaved queued text, and posts the SAME "📨 Queued" tile via the shared
+// notifyQueuedMessage.
+//
+// The queued entry is a spread COPY of blocks: buildSavedMediaBlocks attaches a
+// non-enumerable pending-media-mirror tag, and a spread drops it so the flush
+// can't re-mirror a file the journal already recorded as the client's own
+// event. mirrorToJournal picks the origin: a voice-note transcript stays
+// Matrix-origin so flushQueue's mirrorText journal-publishes it (matching the
+// immediate sendTextToSession); a saved file/image is marked journal-origin so
+// it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
+// like the text path.
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) {
+  if (!session.queuedMessages) session.queuedMessages = [];
+  const entry = [...blocks];
+  if (!mirrorToJournal) markJournalOrigin(entry);
+  session.queuedMessages.push(entry);
+  const ctx = journalSessionCommandCtx(session);
+  await notifyQueuedMessage(session, preview, {
+    sendReply: ctx.sendReply,
+    htmlEscape: escapeHtml,
+  });
+}
 
 function journalOnMedia(session, media, ctx) {
   journalMediaRouter(session, media, ctx);
