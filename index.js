@@ -46,6 +46,7 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
+import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -267,10 +268,18 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath) {
+function generateFileLink(filePath, workdir) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  // Generation-time gate (UX — the viewer re-validates at serve time with
+  // the fd-pinned checks): sensitive names and out-of-workdir targets never
+  // get a link; callers render plain text on null.
+  const gate = checkFileLink(filePath, workdir);
+  if (!gate.ok) {
+    console.log(`file-link denied (${gate.reason}): ${filePath}`);
+    return null;
+  }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ path: filePath, exp, workdir: workdir || null })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -2234,7 +2243,7 @@ function handleClaudeEvent(session, event) {
             const absPath = path.isAbsolute(input.file_path)
               ? input.file_path
               : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
+            const link = generateFileLink(absPath, session.workdir);
             if (link) {
               indicator = `✏️ Writing [${input.file_path}](${link})`;
               indicatorHtml = `✏️ Writing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
@@ -2247,7 +2256,7 @@ function handleClaudeEvent(session, event) {
             const absPath = path.isAbsolute(input.file_path)
               ? input.file_path
               : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
+            const link = generateFileLink(absPath, session.workdir);
             if (link) {
               indicator = `✏️ Editing [${input.file_path}](${link})`;
               indicatorHtml = `✏️ Editing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;

@@ -1,5 +1,4 @@
 import express from 'express';
-import fs from 'fs/promises';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
