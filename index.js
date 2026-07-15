@@ -29,6 +29,7 @@ import {
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
+import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -799,6 +800,14 @@ function recordUserAnswer(session, text, { mirrorToJournal = true } = {}) {
   if (!body) return;
   recordConversationMessage(session, 'user', body);
   if (mirrorToJournal) journalMirrorUserAnswer(session, body);
+}
+
+function reportPromptAnswerDeliveryFailure(session, error) {
+  const detail = error?.message || String(error || 'unknown error');
+  const message = `Could not deliver the prompt answer to Claude: ${detail}`;
+  debug(message);
+  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+  else if (session.sendCallback) session.sendCallback(message);
 }
 
 // Mirror a media upload the user just sent into the journal, once it has been
@@ -1889,14 +1898,16 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     const ftResponse = p.kind === 'arrow-menu'
       ? { kind: 'arrow-menu', key: String(idx) }
       : { kind: p.kind, key: opt.key };
-    session.pendingInteractivePrompt = null;
-    session.iv.respondToPrompt(ftResponse);
-    // The reply goes in via iv.sendText below (not sendToSession), so mirror
-    // the user's answer here — this covers both routeFreeText call sites.
-    mirrorAnswer(replyText);
-    setTimeout(() => {
-      if (session.iv && session.iv.alive) session.iv.sendText(replyText);
-    }, 250);
+    const dispatched = sendDelayedPromptAnswer(session, {
+      response: ftResponse,
+      text: replyText,
+      // The reply goes in via iv.sendText (not sendToSession), so record it
+      // only after that delayed PTY send accepts the text.
+      onDelivered: () => mirrorAnswer(replyText),
+      onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
+    });
+    if (dispatched) session.pendingInteractivePrompt = null;
+    return dispatched;
   };
 
   // yes-no: a binary confirm with no option list or free-text slot.
@@ -1905,9 +1916,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     if (/^(y|yes|1)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'y' }; label = 'Yes'; }
     else if (/^(n|no|2)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'n' }; label = 'No'; }
     if (!response) { session.pendingInteractivePrompt = null; return false; }
-    session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving yes-no prompt reply="${userText}" → key=${response.key}`);
-    session.iv.respondToPrompt(response);
+    if (session.iv.respondToPrompt(response) !== true) return false;
+    session.pendingInteractivePrompt = null;
     mirrorAnswer(label);
     ack(label);
     return true;
@@ -1938,18 +1949,20 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
       // reply ("1. also use compiled css…") already names the option.
       if (hasFreeText) {
         console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} + remark via free-text slot`);
-        routeFreeText(userText);
-        ack(opt.label, { numberPrefix, note: '(with your note)' });
-        return true;
+        if (routeFreeText(userText)) {
+          ack(opt.label, { numberPrefix, note: '(with your note)' });
+          return true;
+        }
+        return false;
       }
       // No free-text channel on this menu — the choice goes through but the
       // remark can't ride along. Send the pick and tell the user.
       const response = p.kind === 'arrow-menu'
         ? { kind: 'arrow-menu', key: String(optIdx) }
         : { kind: p.kind, key: opt.key };
-      session.pendingInteractivePrompt = null;
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
-      session.iv.respondToPrompt(response);
+      if (session.iv.respondToPrompt(response) !== true) return false;
+      session.pendingInteractivePrompt = null;
       mirrorAnswer(`${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
       return true;
@@ -1958,9 +1971,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     const response = p.kind === 'arrow-menu'
       ? { kind: 'arrow-menu', key: String(optIdx) }
       : { kind: p.kind, key: opt.key };
-    session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
-    session.iv.respondToPrompt(response);
+    if (session.iv.respondToPrompt(response) !== true) return false;
+    session.pendingInteractivePrompt = null;
     mirrorAnswer(`${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
     return true;
@@ -1971,8 +1984,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
   // (prevents false-positive detections from blocking free-form messages).
   if (hasFreeText) {
     console.log(`[IV-DEBUG] Routing unmatched reply="${userText}" to free-text slot`);
-    routeFreeText(userText);
-    return true;
+    return routeFreeText(userText);
   }
   session.pendingInteractivePrompt = null;
   return false;
@@ -2310,9 +2322,6 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     session.busy = true;
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
-    // This answer goes in via a raw tool_result stdin write (not
-    // sendToSession), so mirror the user's side of it here.
-    recordUserAnswer(session, answerText, { mirrorToJournal });
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -2325,8 +2334,19 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       }
     }) + '\n';
     debug('Sending answer to stdin:', jsonMsg.trim());
-    session.proc.stdin.write(jsonMsg);
-    if (session.resetTimeout) session.resetTimeout();
+    writePromptAnswer(session, jsonMsg, {
+      // This answer goes in via a raw tool_result stdin write (not
+      // sendToSession), so record it only after stdin accepts the chunk.
+      onDelivered: () => {
+        recordUserAnswer(session, answerText, { mirrorToJournal });
+        if (session.resetTimeout) session.resetTimeout();
+      },
+      onError: (error) => reportSessionSendFailure(
+        session,
+        `Could not send the prompt answer to Claude: ${error.message}`,
+        { restoreJournalState: true },
+      ),
+    });
   }
 }
 
@@ -5603,9 +5623,9 @@ function journalRoutePromptReply(session, { choice, text }) {
       if (resolved) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
+          if (session.iv.respondToPrompt(resp) !== true) return null;
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
-          session.iv.respondToPrompt(resp);
           recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
           return resolved.option.label;
         }
@@ -5621,10 +5641,14 @@ function journalRoutePromptReply(session, { choice, text }) {
       const opt = p.options[idx];
       const ftResponse = p.kind === 'arrow-menu' ? { kind: 'arrow-menu', key: String(idx) } : { kind: p.kind, key: opt.key };
       const freeText = text.trim();
+      const dispatched = sendDelayedPromptAnswer(session, {
+        response: ftResponse,
+        text: freeText,
+        onDelivered: () => recordUserAnswer(session, freeText, { mirrorToJournal: false }),
+        onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
+      });
+      if (!dispatched) return null;
       session.pendingInteractivePrompt = null;
-      session.iv.respondToPrompt(ftResponse);
-      setTimeout(() => { if (session.iv && session.iv.alive) session.iv.sendText(freeText); }, 250);
-      recordUserAnswer(session, freeText, { mirrorToJournal: false });
       return freeText;
     }
     return null;

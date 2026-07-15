@@ -27,6 +27,7 @@ describe('canSwitchAgent', () => {
     expect(canSwitchAgent({ ...idleClaude, busy: true }, 'codex').ok).toBe(false);
     expect(canSwitchAgent({ ...idleClaude, queuedMessages: [{}] }, 'codex').ok).toBe(false);
     expect(canSwitchAgent({ ...idleClaude, waitingForAnswer: {} }, 'codex').message).toContain('pending question');
+    expect(canSwitchAgent({ ...idleClaude, _pendingPromptAnswerDelivery: true }, 'codex').message).toContain('pending question');
     expect(canSwitchAgent({ ...idleClaude, pendingPlan: 'plan' }, 'codex').message).toContain('pending plan');
   });
 });
