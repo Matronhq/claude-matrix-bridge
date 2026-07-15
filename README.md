@@ -1,13 +1,10 @@
-# claude-matrix-bridge
+# matron-bridge
 
-Chat with Claude Code or Codex CLI sessions from anywhere. The bridge spawns and manages coding-agent sessions on your dev box and connects them to two transports:
-
-- **Matrix** — messages arrive in per-session Matrix rooms (E2EE-capable when `ENCRYPT_SESSION_ROOMS=1`), so any Matrix client works.
-- **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
+Chat with Claude Code or Codex CLI sessions from anywhere. The bridge spawns and manages coding-agent sessions on your dev box and connects them to a [matron-journal](https://github.com/Matronhq/matron-journal) server, so the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)) can chat with them — including live typing/streaming indicators and a return path for user input.
 
 Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
 
-Use `/switch codex` or `/switch claude` inside an idle session to hand the same bridge conversation to the other agent. The bridge keeps separate native session IDs for Claude and Codex, resumes each one when you switch back, and prepends only the transcript messages that agent has not seen to your next real prompt. The room and Matron conversation ID stay stable, as do the shared working directory, files, and Git state. Provider-private reasoning and tool state are not transferable.
+Use `/switch codex` or `/switch claude` inside an idle session to hand the same bridge conversation to the other agent. The bridge keeps separate native session IDs for Claude and Codex, resumes each one when you switch back, and prepends only the transcript messages that agent has not seen to your next real prompt. The Matron conversation ID stays stable, as do the shared working directory, files, and Git state. Provider-private reasoning and tool state are not transferable.
 
 Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
 
@@ -17,9 +14,9 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 ## Requirements
 
-- Node.js 22+ (matrix-js-sdk 41.x uses `Promise.withResolvers`, which only landed in v22)
+- Node.js 22+
 - Claude Code CLI and/or Codex CLI installed and authenticated
-- A Matrix homeserver, such as [matron-server](https://github.com/matronhq/matron-server), Matron's branch of Tuwunel, with a bot account
+- A [matron-journal](https://github.com/Matronhq/matron-journal) server and an agent token for the bridge (`matron-admin agent add <user> <device-name>` on the journal server)
 
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
 
@@ -36,7 +33,7 @@ brew install cloudflared
 ```bash
 npm install
 cp .env.example .env
-# Edit .env — add your MATRIX_ACCESS_TOKEN and ALLOWED_USER_IDS
+# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN) and ALLOWED_USER_IDS
 npm start
 ```
 
@@ -44,11 +41,6 @@ To run as a managed service, use the OS-detecting installer:
 
 ```bash
 setup/install.sh                # installs npm deps, seeds .env
-# edit .env, or import a bot blob:
-node setup/import-bot-blob.mjs 'db1:...'
-
-# macOS can import during install:
-setup/install.sh --blob 'db1:...'
 
 # Linux (systemd):
 sudo setup/service.sh
@@ -65,49 +57,9 @@ time).
 
 ## Publishing The Viewer On macOS
 
-The macOS service installer starts both the Matrix bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRIX_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
+The macOS service installer starts both matron-bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
 
-To make those links usable from Matrix clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer. The Cloudflare helper is dry-run by default and is careful around existing tunnel setups:
-
-```bash
-setup/cloudflare.sh --hostname viewer.example.com
-```
-
-If you already have a tunnel on the machine, copy the printed ingress rule into your existing cloudflared config:
-
-```yaml
-- hostname: viewer.example.com
-  service: http://127.0.0.1:9803
-```
-
-Then set the bridge URL and reload launchd environment values:
-
-```bash
-setup/cloudflare.sh --hostname viewer.example.com --apply-env
-setup/service.sh
-```
-
-For API-backed DNS or tunnel work, pass a one-shot Cloudflare token. The helper does not persist the token:
-
-```bash
-CLOUDFLARE_API_TOKEN=... setup/cloudflare.sh \
-  --hostname viewer.example.com \
-  --tunnel-id <tunnel-id> \
-  --apply-dns
-```
-
-To create a bridge-managed tunnel config instead of editing an existing one:
-
-```bash
-CLOUDFLARE_API_TOKEN=... setup/cloudflare.sh \
-  --hostname viewer.example.com \
-  --create-tunnel \
-  --write-config \
-  --apply-dns \
-  --apply-env
-```
-
-That writes only bridge-managed files under `~/.cloudflared` by default. Existing non-bridge cloudflared configs are reported but not overwritten.
+To make those links usable from Matron clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer (e.g. via a Cloudflare named tunnel or your own reverse proxy pointed at `127.0.0.1:$MATRON_VIEWER_PORT`). The bridge no longer ships its own Cloudflare tunnel helper — provisioning the tunnel/DNS is a dev-box-level concern, not something this repo manages.
 
 ### Live command output rides the journal protocol
 
@@ -125,20 +77,20 @@ secret requests, and one-time sensitive-data links.
 
 | Action | Command |
 |---|---|
-| Status | `systemctl status claude-matrix-bridge` |
-| Restart | `sudo systemctl restart claude-matrix-bridge` |
-| Logs | `journalctl -u claude-matrix-bridge -f` |
-| Stop | `sudo systemctl stop claude-matrix-bridge` |
+| Status | `systemctl status matron-bridge` |
+| Restart | `sudo systemctl restart matron-bridge` |
+| Logs | `journalctl -u matron-bridge -f` |
+| Stop | `sudo systemctl stop matron-bridge` |
 
 **macOS (launchd, user scope):**
 
 | Action | Command |
 |---|---|
-| Status | `launchctl print gui/$UID/chat.matron.claude-matrix-bridge \| head -20` |
-| Restart | `launchctl kickstart -k gui/$UID/chat.matron.claude-matrix-bridge` |
-| Logs | `tail -f ~/Library/Logs/claude-matrix-bridge.log` |
-| Stop | `launchctl kill TERM gui/$UID/chat.matron.claude-matrix-bridge` |
-| Uninstall | `launchctl bootout gui/$UID/chat.matron.claude-matrix-bridge && rm ~/Library/LaunchAgents/chat.matron.claude-matrix-bridge.plist` |
+| Status | `launchctl print gui/$UID/chat.matron.matron-bridge \| head -20` |
+| Restart | `launchctl kickstart -k gui/$UID/chat.matron.matron-bridge` |
+| Logs | `tail -f ~/Library/Logs/matron-bridge.log` |
+| Stop | `launchctl kill TERM gui/$UID/chat.matron.matron-bridge` |
+| Uninstall | `launchctl bootout gui/$UID/chat.matron.matron-bridge && rm ~/Library/LaunchAgents/chat.matron.matron-bridge.plist` |
 
 For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/LaunchAgents` with `/Library/LaunchDaemons`.
 
@@ -146,29 +98,22 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 
 | Variable | Description | Default |
 |---|---|---|
-| `MATRIX_HOMESERVER_URL` | Matrix homeserver URL (required) | `http://localhost:6167` |
-| `MATRIX_ACCESS_TOKEN` | Bot account access token (required) | — |
-| `MATRIX_BOT_USER_ID` | Imported bot user ID from an add-bot blob, used for first-start bootstrap when `MATRIX_ACCESS_TOKEN` is empty | — |
-| `MATRIX_BOT_PASSWORD` | Imported bot password from an add-bot blob | — |
-| `MATRIX_BOT_RECOVERY_KEY` | Imported bot recovery key from an add-bot blob | — |
-| `BRIDGE_ROOM_ID` | Imported bridge room ID from an add-bot blob, used by helper tools | — |
-| `ALLOWED_USER_IDS` | Comma-separated Matrix user IDs (e.g. `@alice:matron.chat`) | `""` (any user) |
+| `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`); override per command with `--claude` / `--codex` | `claude` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
-| `ENCRYPT_SESSION_ROOMS` | Set to `0` to create unencrypted per-session rooms. Unset or `1` creates encrypted per-session rooms. | enabled |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
 | `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
-| `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work over Matrix | `0` |
+| `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
-| `MATRIX_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
-| `MATRIX_VIEWER_PORT` | Local file viewer port | `9803` |
+| `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
+| `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 
 ## Commands
 
@@ -197,18 +142,18 @@ Any other message is forwarded directly to the selected agent. Claude Code slash
 
 ## Matron journal transport
 
-Optionally, the bridge connects to a [matron-journal](https://github.com/Matronhq/matron-journal) server as an **agent** device and dual-posts everything alongside Matrix. Leave `JOURNAL_WS_URL` or the token unset to disable; a journal outage never affects Matrix behavior.
+The bridge connects to a [matron-journal](https://github.com/Matronhq/matron-journal) server as an **agent** device — this is the bridge's sole transport. `JOURNAL_WS_URL` and an agent token (`JOURNAL_TOKEN_FILE` or `JOURNAL_TOKEN`) are required; the bridge exits at startup without them.
 
 What rides the journal connection:
 
 - **Outbound mirror** — session output, uploaded files/images (media mirroring), and read-marker advances are published as journal events. The media HTTP endpoint is derived from `JOURNAL_WS_URL`; no extra config.
 - **Ephemeral live UX** — activity indicators (typing / "running `<command>`…") and in-progress assistant-text streaming for Matron clients viewing the conversation. Best-effort: never queued or replayed, so an outage means a missed indicator, not a stale one.
-- **Return path** — user messages and prompt-button replies sent from Matron clients are routed into the owning Claude session. The inbound cursor persists to `JOURNAL_CURSOR_FILE` so a restart resumes where it left off.
+- **Return path** — user messages and prompt-button replies sent from Matron clients are routed into the owning coding-agent session. The inbound cursor persists to `JOURNAL_CURSOR_FILE` so a restart resumes where it left off.
 - **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [dir]` (alias `new`), `/sessions` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation. `/` and `!` prefixes are interchangeable.
 
 | Variable | Description | Default |
 |---|---|---|
-| `JOURNAL_WS_URL` | Journal server WebSocket URL; unset disables the journal transport | — |
+| `JOURNAL_WS_URL` | Journal server WebSocket URL (required) | — |
 | `JOURNAL_TOKEN_FILE` | Path to a file containing the agent token (takes precedence over `JOURNAL_TOKEN`) | — |
 | `JOURNAL_TOKEN` | Raw agent token | — |
 | `JOURNAL_CURSOR_FILE` | Where the inbound cursor is persisted | `journal-cursor.json` in the repo root |
@@ -219,11 +164,11 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 
 ## How it works
 
-1. Matrix messages arrive via `matrix-bot-sdk`
+1. User messages arrive via the matron-journal WebSocket connection
 2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex is run with `codex exec --json`
 3. User messages are sent as Claude stream JSON or as a Codex stdin prompt
 4. Structured JSON events are parsed from stdout and normalized into the shared bridge session lifecycle
-5. The complete response is sent to the Matrix room when a `result` event arrives (turn complete)
+5. The complete response is published to the journal when a `result` event arrives (turn complete)
 6. Long responses are split at 32K-char boundaries
 7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
@@ -233,18 +178,19 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 ## File structure
 
 ```
-claude-matrix-bridge/
-├── index.js              # Main bridge (Matrix + journal wiring, session lifecycle)
+matron-bridge/
+├── index.js              # Main bridge (journal wiring, session lifecycle)
 ├── lib/                  # Bridge modules: journal-* (Matron transport), command
 │                         # dispatch, prompt detection/buttons, PTY interactive mode,
 │                         # media mirroring, transcription, session summaries, …
 ├── ask-user.js           # MCP server for user questions / secure secret flows
 ├── BRIDGE_CLAUDE.md      # Extra instructions for bridge-spawned Claude sessions
+├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
-├── setup/                # OS-dispatching installer, service, whisper, Cloudflare
+├── setup/                # OS-dispatching installer, service, whisper
 ├── hooks/                # Claude Code hooks used by bridge sessions
-├── test/                 # node --test suite
+├── test/                 # Vitest suite
 ├── docs/
 ├── SECURITY.md
 ├── package.json

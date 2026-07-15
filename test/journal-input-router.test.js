@@ -579,9 +579,13 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
 // in-process, so pin by source inspection that (a) the journal input
 // consumer is actually handed a resumeSessionForConvo (the lib treats it as
 // optional, so omitting it silently reverts to the "no longer active" dead
-// end), and (b) the journal path and the Matrix room.message path respawn
-// persisted sessions through the SAME helper, so the two transports can't
-// drift apart on what a resume restores.
+// end), and (b) the journal resume path (journalResumeConvo) routes through
+// resumePersistedSession — the single shared respawn helper — instead of
+// reimplementing resume inline, and suppresses the helper's own room-facing
+// notice so a resume triggered from the journal produces exactly one
+// journal message. (Matrix had its own room.message auto-resume branch
+// through this same helper; it was removed in Task 4, leaving the journal
+// path as the sole caller.)
 describe('index.js journal input consumer — auto-resume wiring (source inspection)', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
@@ -596,11 +600,15 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(args).toMatch(/\bresumeSessionForConvo\b/);
   });
 
-  it('the Matrix auto-resume branch and the journal resume share one respawn helper', () => {
-    // 1 function declaration + at least 2 call sites (Matrix handler,
-    // journal resume).
+  it('the journal resume path routes through the single shared respawn helper', () => {
+    // Originally pinned "1 function declaration + at least 2 call sites
+    // (Matrix handler, journal resume)" — the Matrix auto-resume branch was
+    // removed in Task 4, so only the journal call site remains. The
+    // surviving invariant: resume isn't reimplemented inline in the journal
+    // path — journalResumeConvo still calls the one shared helper (1
+    // declaration + at least 1 call site).
     const uses = src.match(/\bresumePersistedSession\(/g) || [];
-    expect(uses.length).toBeGreaterThanOrEqual(3);
+    expect(uses.length).toBeGreaterThanOrEqual(2);
   });
 
   it('a journal-triggered resume produces ONE journal message, not two', () => {
@@ -615,9 +623,16 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(body).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: true \}\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
-    // notice (the session's own sendCallback/sendHtml stay mirrored).
+    // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
+    // the slice at the next surviving section header (Local HTTP API, which
+    // now immediately follows resumePersistedSession — the old anchor,
+    // `// --- Matrix Message Handler ---`, was deleted in Task 4) so the
+    // body stays scoped to resumePersistedSession itself; assert hEnd was
+    // actually found so a future rename can't silently widen this slice to
+    // near-EOF and pass by accident again.
     const hStart = src.indexOf('function resumePersistedSession(');
-    const hEnd = src.indexOf('\n// --- Matrix Message Handler ---', hStart);
+    const hEnd = src.indexOf('\n// --- Local HTTP API ---', hStart);
+    expect(hEnd).toBeGreaterThan(hStart);
     const hBody = src.slice(hStart, hEnd);
     expect(hBody).toMatch(/skipJournalMirror = false/);
     expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
@@ -669,6 +684,122 @@ describe('promptExpectsReply', () => {
 
   it('a mixed set with any answerable-looking option stays guarded', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet' }, { id: 'opt_a' }] })).toBe(true);
+  });
+});
+
+// Client-sent media (file/image/voice-note) events: a `type:'file'|'image'`
+// frame from a user:* sender carries a blob_ref the caller fetches out of the
+// journal blob store. The router only CLASSIFIES and resolves the frame into a
+// {type, blobRef, contentType, name, size, dims} shape and hands it to the
+// injected routeMediaToSession seam (the fetch + transcribe/save + inject
+// lives in index.js/lib/journal-media.js, exercised separately). Media routing
+// is gated on the seam being present, so a bridge without it keeps the old
+// publish-only behavior for file/image frames.
+describe('createJournalInputConsumer — media (file/image) routing', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: (id) => id === 'control-1',
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routeMediaToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const fileFrame = (overrides = {}) => baseFrame({
+    type: 'file',
+    payload: { blob_ref: 'blob-1', content_type: 'application/pdf', name: 'report.pdf', size: 1234 },
+    ...overrides,
+  });
+
+  it('routes a user file event to routeMediaToSession with the resolved media shape', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    const [session, media, ctx] = deps.routeMediaToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(media).toEqual({
+      type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
+      name: 'report.pdf', size: 1234, dims: null,
+    });
+    expect(ctx).toEqual({ username: 'dan' });
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('routes a user image event and passes through image dims', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'img-9', content_type: 'image/png', name: 'shot.png', size: 55, dims: { w: 800, h: 600 } },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    const [, media] = deps.routeMediaToSession.mock.calls[0];
+    expect(media).toEqual({
+      type: 'image', blobRef: 'img-9', contentType: 'image/png',
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 },
+    });
+  });
+
+  it('falls back to a top-level frame.blob_ref when the payload has none', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'file', blob_ref: 'top-level-blob',
+      payload: { content_type: 'audio/ogg', name: 'voice.ogg' },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeMediaToSession.mock.calls[0][1].blobRef).toBe('top-level-blob');
+  });
+
+  it('drops a media event with no blob_ref (nothing to fetch): warns, never routes, never throws', () => {
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame({ type: 'file', payload: { content_type: 'application/pdf', name: 'x.pdf' } }))).not.toThrow();
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(warnings.some(w => /blob_ref/.test(w))).toBe(true);
+  });
+
+  it('ignores agent-sender media events (loop prevention — same as text echoes)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame({ sender: 'agent:dev-2' }));
+    consumer(baseFrame({ type: 'image', sender: 'agent:dev-2', payload: { blob_ref: 'b', content_type: 'image/png' } }));
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('media for an unknown/dead session notices and drops, never routes (media is not auto-resumed)', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'x' })) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'file', username: 'dan' });
+  });
+
+  it('media in the control convo is ignored (control understands only text commands)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame({ convo_id: 'control-1' }));
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('without a routeMediaToSession seam, file/image frames stay pass-through (never looked up or routed)', () => {
+    const deps = makeDeps({ routeMediaToSession: undefined });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    consumer(baseFrame({ type: 'image', payload: { blob_ref: 'b', content_type: 'image/png' } }));
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
   });
 });
 

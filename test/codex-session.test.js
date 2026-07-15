@@ -111,7 +111,13 @@ describe('Codex bridge wiring', () => {
     );
     expect(body).toMatch(/if \(sent\) \{[\s\S]*commitDispatchedUserTurn/);
     expect(body).toMatch(/if \(!sent\) \{[\s\S]*return reportSessionSendFailure/);
-    expect(src.match(/if \(!session\._sendFailureReported\)/g)?.length).toBeGreaterThanOrEqual(2);
+
+    const reportStart = src.indexOf('function reportSessionSendFailure(');
+    const reportEnd = src.indexOf('\nfunction flushResponse(', reportStart);
+    const reporter = src.slice(reportStart, reportEnd);
+    expect(reporter).toMatch(/session\.sendHtml[\s\S]*session\.sendCallback/);
+    expect(reporter).toContain('return false');
+    expect(reporter).not.toContain('_sendFailureReported');
   });
 
   it('refreshes the persisted native thread ID without replacing a stable journal ID', () => {
