@@ -204,6 +204,28 @@ describe('createSubagentConvoTracker', () => {
     expect(publisher.calls.upsertConvo).toHaveLength(0);
   });
 
+  it('a late title refresh on a done child never flips it back to running', () => {
+    // Discovery with only the short-id fallback (meta.json not written yet).
+    tracker.noteTaskStarted('toolu_1');
+    tracker.discover('agent-1', { label: 'deadbeef', agentType: null });
+    tracker.noteTaskResult('toolu_1'); // parent tool_result -> done
+
+    // Trailing tail events after completion are expected (the final answer
+    // drains after the parent's tool_result) — now the real label arrives.
+    publisher.calls.upsertConvo.length = 0;
+    const child = tracker.onEvent('agent-1', { label: 'Explore auth', agentType: 'code-explorer', event: subagentAssistantEvent({}) });
+
+    // Content may still route (index.js publishes the trailing text) ...
+    expect(child.convoId).toBe('parent-uuid:sub:agent-1');
+    // ... and the title refresh upsert must re-assert the child's ACTUAL
+    // state, never resurrect 'running' (the tracker already thinks it is
+    // finished, so nothing would ever set it back to done).
+    const refresh = publisher.calls.upsertConvo.find(u => u.opts.title === 'Explore auth');
+    expect(refresh).toBeTruthy();
+    expect(refresh.opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    expect(publisher.calls.upsertConvo.some(u => u.opts.sessionState === CHILD_STATE_RUNNING)).toBe(false);
+  });
+
   it('finishAll sweeps every still-running child to done exactly once', () => {
     tracker.discover('agent-1', { label: 'A', agentType: null });
     tracker.discover('agent-2', { label: 'B', agentType: null });
