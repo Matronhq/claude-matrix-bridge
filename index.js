@@ -1,7 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
-import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -30,13 +29,9 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
-  classifyBridgeCommand,
-  classifyPrintRescue,
-  classifyRescueKeystroke,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
@@ -51,7 +46,7 @@ import { createJournalPublisher } from './lib/journal-publisher.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
-import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
+import { pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -139,9 +134,6 @@ for (const ex of knownMcpExtras()) {
     console.warn(`[mcp-config] Flag --${ex} is recognised but no matching mcpExtras block exists; sessions opting in will get no extra servers.`);
   }
 }
-const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
-const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
-
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
@@ -282,14 +274,6 @@ function generateFileLink(filePath, workdir) {
   const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
-}
-
-function generateActionLink(action, roomId, extras) {
-  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ action, roomId, exp, ...extras })).toString('base64url');
-  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
-  return `${VIEWER_BASE_URL}/action?token=${payload}.${sig}`;
 }
 
 function generateSecretLink(secretId, label, roomId) {
@@ -3063,35 +3047,6 @@ function splitMessage(text) {
   return chunks;
 }
 
-// --- Auth helper ---
-
-function isAllowed(userId) {
-  if (ALLOWED_USER_IDS.length === 0) return true;
-  return ALLOWED_USER_IDS.includes(String(userId));
-}
-
-// Track senders we've already warned about so a chatty disallowed user
-// doesn't flood the log, but a misconfigured allowlist still screams once
-// per restart per offender. Without this, ALLOWED_USER_IDS mismatches
-// (e.g. dbarker on Matrix vs danbarker on the VPS) look exactly like
-// "the bridge is dead" — bridge runs, sync runs, messages are decrypted,
-// then silently dropped. The previous behaviour cost about an hour of
-// debugging on the first external-mode box.
-const warnedDisallowedSenders = new Set();
-function warnIfDisallowed(sender, roomId) {
-  if (isAllowed(sender)) return false;
-  if (!warnedDisallowedSenders.has(sender)) {
-    warnedDisallowedSenders.add(sender);
-    console.warn(
-      `[allowlist] Dropping message from ${sender} in ${roomId} — ` +
-      `not in ALLOWED_USER_IDS (${ALLOWED_USER_IDS.join(', ') || '(empty — set to reject all)'}). ` +
-      `If this is you, fix ALLOWED_USER_IDS in .env (your full Matrix ID, e.g. @you:server) and restart the bridge. ` +
-      `Suppressing further warnings from this sender until restart.`
-    );
-  }
-  return true;
-}
-
 // --- Markdown to HTML ---
 
 function escapeHtml(text) {
@@ -3259,22 +3214,6 @@ function plainTextFormat(text) {
   });
 }
 
-// --- File Helpers ---
-
-function deduplicateFilename(dir, filename) {
-  let target = path.join(dir, filename);
-  if (!fs.existsSync(target)) return target;
-
-  const ext = path.extname(filename);
-  const base = path.basename(filename, ext);
-  let i = 1;
-  while (fs.existsSync(target)) {
-    target = path.join(dir, `${base}-${i}${ext}`);
-    i++;
-  }
-  return target;
-}
-
 // --- Send to Session ---
 
 // skipJournalMirror: set by the journal input consumer's Matrix echoes
@@ -3317,7 +3256,7 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
   return null;
 }
 
-async function sendLiveOutputEvent(session, { tool_use_id, command }) {
+async function sendLiveOutputEvent(session, { command }) {
   // 'tool' activity, detail = the command — this is the one place index.js
   // knows the command string at tool-start time. The DURABLE tool_output
   // journal event is now published at COMPLETION (stopAndFinalizeToolStream),
@@ -3465,7 +3404,12 @@ function sweepToolStreams(session) {
   }
 }
 
-async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
+// fallbackBody/fallbackHtml are the retired Matrix plain/HTML fallback text.
+// Still accepted because ~11 call sites pass them positionally through the
+// session.sendButtonMessage closures; the journal publishes structured
+// prompts and ignores them. Retiring the whole fallback-text plumbing is a
+// tracked follow-up.
+async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
   if (journalSession) {
