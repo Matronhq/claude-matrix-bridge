@@ -88,6 +88,14 @@ The no-op publisher (used when the journal is unconfigured in tests) gains a
 ends in exactly one `respondRpc` targeting `request.from_device_id` with the
 request's `request_id`.
 
+**The answer-every-request guarantee lives HERE, structurally:** the
+handler's entire dispatch is wrapped in try/catch, and the catch itself
+responds `ok:false, error:{code:'internal', detail:<message>}` (respondRpc
+never throws — it swallows internally). The publisher-level catch around
+`onRpcRequest` (section 1) is only a last-resort log for the pathological
+case where even that response path throws; it must never be the sole thing
+standing between a handler bug and a client timeout.
+
 **`recent_folders`** — params ignored. Source of truth is the persisted
 session store (`~/.claude-matrix-sessions.json`, records carry
 `{workdir, lastUsed}`): dedupe by workdir keeping the max `lastUsed`, sort
@@ -115,12 +123,27 @@ chat reply:
   detail:<resolved path>}`. Omitted/empty → `DEFAULT_WORKDIR`.
 - `browser === true` → `mcpExtras: ['browser']` (same effect as `--browser`);
   anything else → no extras.
-- Mint `newSessionConvoId()`, `createSession(convoId, workdir, undefined,
-  { mcpExtras })`, `persistSession(...)` as `!start` does (originRoomId
-  null — there is no origin chat room for an RPC start).
-- Success: `{convo_id: <the id>}`. The `convo_upsert` announcing the new
-  conversation flows on the journal as usual; per the journal spec the app
-  must tolerate either ordering between that and this response.
+- Mint a room key with `newSessionConvoId()` and call
+  `const session = createSession(roomKey, workdir, undefined, { mcpExtras })`,
+  persisting as `!start` does (originRoomId null — there is no origin chat
+  room for an RPC start).
+- Success: `{convo_id: session.claudeSessionId}` — **not** the room key.
+  The room key is only the bridge's sessions-map/persistence identifier;
+  `createInteractiveSessionForRoom` mints its own session UUID and *that*
+  (`session.claudeSessionId`) is what every journal frame and the
+  `convo_upsert` carry (index.js: "The journal's convo_id is the Claude
+  session UUID"). Returning the room key would send the app to a
+  conversation id the journal never uses.
+- Interactive mode (the default, and what every dev box runs) sets
+  `claudeSessionId` synchronously at spawn. If the resolved mode is
+  print-mode the id is not known at return: kill the just-created session
+  (the `!stop` teardown) and answer `ok:false,
+  error:{code:'unsupported_mode', detail:'print-mode bridges cannot answer
+  start'}` — v1 explicitly does not support RPC-start on print-mode
+  bridges.
+- The `convo_upsert` announcing the new conversation flows on the journal
+  as usual; per the journal spec the app must tolerate either ordering
+  between that and this response.
 - `createSession` throwing → `ok:false, error:{code:'spawn_failed',
   detail:<message>}`.
 
@@ -158,10 +181,14 @@ Repo-idiomatic `node:test` files:
   `createSession`/`persistSession`/store access stubbed per existing test
   idioms): `recent_folders` dedupes/sorts/caps and appends
   `DEFAULT_WORKDIR` with `last_used:null`; `start` happy path returns the
-  minted convo id and passes the resolved workdir + mcpExtras to
-  `createSession`; `bad_workdir` on missing dir; `spawn_failed` on a
-  throwing `createSession`; `browser:true` → `['browser']`; unknown method
-  → `unknown_method`; every branch responds exactly once to
+  stubbed session's `claudeSessionId` (NOT the room key passed to
+  `createSession`) and passes the resolved workdir + mcpExtras through;
+  `bad_workdir` on missing dir; `spawn_failed` on a throwing
+  `createSession`; a stubbed session without `claudeSessionId` →
+  `unsupported_mode` and the session is torn down; `browser:true` →
+  `['browser']`; unknown method → `unknown_method`; a handler-internal
+  throw (e.g. the persisted-store read throwing) still answers exactly one
+  `{code:'internal'}` response; every branch responds exactly once to
   `from_device_id`.
 
 ## Rollout
