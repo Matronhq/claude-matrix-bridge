@@ -29,6 +29,7 @@ import {
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
+import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -56,9 +57,32 @@ import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfter
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig } from './lib/session-status.js';
+import {
+  AGENT_CLAUDE,
+  AGENT_CODEX,
+  agentLabel,
+  extractAgentFlag,
+  normalizeAgent,
+  resolveAgent,
+} from './lib/agent-backend.js';
+import {
+  buildAgentHandoffPrompt,
+  canSwitchAgent,
+  getPersistedAgentState,
+  matchSessionIdPrefix,
+  mergeAgentStates,
+  normalizeHistoryCursor,
+  otherAgent,
+  prependHandoffPrompt,
+  resolveNativeSessionIdForPersistence,
+  snapshotAgentState,
+} from './lib/agent-handoff.js';
+import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
-const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
+const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
+const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
+const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
 
 // --- Config ---
 
@@ -68,6 +92,11 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .filter(Boolean);
 
 const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
+const DEFAULT_AGENT = resolveAgent({ fallback: process.env.MATRON_DEFAULT_AGENT || AGENT_CLAUDE });
+if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAULT_AGENT)) {
+  console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
+}
+const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -154,6 +183,7 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
+const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -169,6 +199,17 @@ function loadBridgeSystemPrompt() {
 }
 
 const BRIDGE_SYSTEM_PROMPT = loadBridgeSystemPrompt();
+
+function loadCodexBridgePrompt() {
+  try {
+    return fs.readFileSync(BRIDGE_CODEX_MD_PATH, 'utf-8').trim();
+  } catch (e) {
+    console.warn(`Could not read Codex bridge instructions from ${BRIDGE_CODEX_MD_PATH}: ${e.message}`);
+    return FALLBACK_CODEX_BRIDGE_PROMPT;
+  }
+}
+
+const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
 
 // Live-bash-output store (per-process). Tracks active matron-tee'd Bash commands
 // so that tool_result events can write the corresponding .done sentinel.
@@ -341,14 +382,63 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (live?.agent) derived.agent = live.agent;
+  if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
+  const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
+  const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
+  const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
+  const currentState = activeAgent
+    ? getPersistedAgentState(existing, activeAgent, historyLength)
+    : null;
+  const sameAgent = !!activeAgent && activeAgent === existingAgent;
+  // A null live ID normally means the CLI has not announced it yet, not that
+  // an established same-provider ID should be erased. Agent switches are the
+  // intentional reset case: activeAgent differs, so null remains null.
+  const effectiveSessionId = resolveNativeSessionIdForPersistence({
+    sessionId,
+    currentStateId: currentState?.sessionId,
+    existingSessionId: existing.sessionId,
+    sameAgent,
+  });
+  // A newly created room (notably !resume) may inherit both providers from a
+  // different persisted room. Carry that live inherited map automatically so
+  // later narrow persistence calls cannot silently discard the inactive
+  // provider, then apply any explicit caller update on top.
+  let agentSessions = mergeAgentStates(existing.agentSessions, live?._agentSessions);
+  agentSessions = mergeAgentStates(agentSessions, extra?.agentSessions);
+  if (activeAgent) {
+    let state = live?.agent === activeAgent
+      ? snapshotAgentState(
+        live,
+        Number.isFinite(live._agentHistoryCursor)
+          ? live._agentHistoryCursor
+          : (live.chatHistory?.length || 0),
+      )
+      : {
+        ...currentState,
+        sessionId: sessionId || currentState.sessionId,
+        model: extra?.model !== undefined ? extra.model : currentState.model,
+        interactiveMode: extra?.interactiveMode !== undefined
+          ? extra.interactiveMode
+          : currentState.interactiveMode,
+        mcpExtras: Array.isArray(extra?.mcpExtras) ? extra.mcpExtras : currentState.mcpExtras,
+        lastUsed: Date.now(),
+      };
+    if (sameAgent && !state.sessionId && effectiveSessionId) {
+      state = { ...state, sessionId: effectiveSessionId };
+    }
+    agentSessions = mergeAgentStates(agentSessions, { [activeAgent]: state });
+  }
   data[String(roomId)] = {
     ...existing,
     ...derived,
-    sessionId,
+    sessionId: effectiveSessionId,
     workdir,
     lastUsed: Date.now(),
     originRoomId: originRoomId || null,
     ...(extra || {}),
+    ...(activeAgent ? { agent: activeAgent } : {}),
+    agentSessions,
   };
   savePersistedSessions(data);
 }
@@ -356,6 +446,43 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
 function getPersistedSession(roomId) {
   const data = loadPersistedSessions();
   return data[String(roomId)] || null;
+}
+
+// Codex stores rollouts in a date-partitioned tree rather than Claude's
+// per-workdir directory. For bridge-owned Codex conversations, the bridge's
+// persistence file is the authoritative bounded index and also carries the
+// workdir/summary needed by /sessions and /resume.
+function listPersistedAgentSessions(agent, workdir = null) {
+  const byId = new Map();
+  for (const entry of Object.values(loadPersistedSessions())) {
+    if (!entry) continue;
+    if (workdir && entry.workdir !== workdir) continue;
+    const historyLength = Array.isArray(entry.chatHistory) ? entry.chatHistory.length : 0;
+    const state = getPersistedAgentState(entry, agent, historyLength);
+    if (!state.sessionId) continue;
+    const current = byId.get(state.sessionId);
+    const modified = state.lastUsed || entry.lastUsed || 0;
+    if (current && (current.lastUsed || 0) >= modified) continue;
+    const firstUser = Array.isArray(entry.chatHistory)
+      ? entry.chatHistory.find(item => item?.role === 'user' && item.text)?.text || ''
+      : '';
+    byId.set(state.sessionId, {
+      ...entry,
+      ...state,
+      agent,
+      sessionId: state.sessionId,
+      modified,
+      lastUsed: modified,
+      summary: firstUser.slice(0, 80) + (firstUser.length > 80 ? '…' : ''),
+    });
+  }
+  return [...byId.values()].sort((a, b) => b.modified - a.modified);
+}
+
+function findPersistedAgentSession(agent, sessionId) {
+  if (!sessionId) return null;
+  return listPersistedAgentSessions(agent)
+    .find(entry => entry.sessionId === sessionId) || null;
 }
 
 // --- Session Manager ---
@@ -404,24 +531,32 @@ const journalRpcHandler = createRpcRequestHandler({
   log: console,
 });
 
+
+function journalConvoIdFor(session) {
+  return session?.journalConvoId || session?.claudeSessionId || null;
+}
+
 // Reverse lookup for the journal return path: a journal frame's convo_id is
-// session.claudeSessionId, but `sessions` is keyed by roomId. The session
+// the stable bridge conversation ID (historically the first native Claude
+// session ID), but `sessions` is keyed by roomId. The session
 // count is small (a handful of concurrent rooms per box), so a linear scan
 // on each inbound event is simpler than maintaining a second map in sync
 // with every place a session is created/restarted/deleted.
 function findSessionByClaudeSessionId(claudeSessionId) {
   if (!claudeSessionId) return null;
   for (const session of sessions.values()) {
-    if (session.claudeSessionId === claudeSessionId) return session;
+    if (journalConvoIdFor(session) === claudeSessionId || session.claudeSessionId === claudeSessionId) return session;
   }
   return null;
 }
 
 // --- Journal dual-post mirroring ---
 //
-// The journal's convo_id is the Claude session UUID (session.claudeSessionId).
-// It's known immediately in interactive mode (assigned at spawn) but only
-// after the first transcript event lands in print mode. Until it's known,
+// A legacy conversation uses the first native session UUID as its journal
+// convo_id. Agent-switching keeps that ID stable in session.journalConvoId
+// while session.claudeSessionId changes between provider-native sessions.
+// The ID is known immediately in interactive mode (assigned at spawn) but only
+// after the first transcript event lands in fresh print mode. Until it's known,
 // journal traffic for that session is buffered (bounded) and flushed —
 // convo_upsert first, then the buffered frames in order — the moment the id
 // shows up (see the session_id capture in handleClaudeEvent). Rooms that
@@ -444,7 +579,8 @@ function journalBufferPush(session, method, payload) {
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 function journalPublish(session, method, payload) {
   if (!JOURNAL_ENABLED) return;
-  if (session.claudeSessionId) {
+  const convoId = journalConvoIdFor(session);
+  if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
     // with) the first publish to a convo — the server hard-rejects publishes
     // to conversations that don't exist yet. Print-mode sessions get this via
@@ -454,10 +590,10 @@ function journalPublish(session, method, payload) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        journalPublisher.upsertConvo(session.claudeSessionId, { title: session._journalTitleHint });
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
       }
     }
-    journalPublisher[method](session.claudeSessionId, payload);
+    journalPublisher[method](convoId, payload);
   } else {
     journalBufferPush(session, method, payload);
   }
@@ -483,7 +619,7 @@ function journalSeedTitle(session) {
 // answers, media uploads) MUST route through this rather than calling
 // journalPublish directly, so the markRead pairing can't be forgotten by a
 // future seam. journalPublish already handles the pre-session-id buffering
-// case (session.claudeSessionId not yet known) for both calls, so a buffered
+// case (neither journalConvoId nor claudeSessionId known yet) for both calls, so a buffered
 // markRead replays right after its paired publish, in order, once the
 // session id shows up (see journalFlushForSession).
 function journalPublishUserItem(session, method, payload) {
@@ -516,10 +652,11 @@ function journalSessionState(session, state) {
 // session_status vs. ephemeral activity) that don't always change together.
 function journalActivity(session, state, detail) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
-  journalPublisher.publishActivity(session.claudeSessionId, state, detail);
+  journalPublisher.publishActivity(convoId, state, detail);
 }
 
 // Compute and publish a structured `diff` journal event for an
@@ -622,15 +759,22 @@ function getAccountEmail() {
 // end, and the journal server's per-convo cache makes redelivery idempotent.
 function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const status = buildSessionStatus({
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
     limits: usageLimitsCache.lines,
     email: getAccountEmail(),
   });
+  // The shared account cache is Claude-specific. Preserve the established
+  // status-builder wiring above, then strip those fields from Codex frames.
+  if (session.agent === AGENT_CODEX) {
+    delete status.limits;
+    delete status.email;
+  }
   if (Object.keys(status).length === 0) return;
-  journalPublisher.publishStatus(session.claudeSessionId, status);
+  journalPublisher.publishStatus(convoId, status);
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -646,7 +790,8 @@ function journalStatus(session) {
 // (latest-wins), never a delta — see the publisher's wire-contract comment.
 function journalStream(session, messageId, replaceText) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const nextRef = streamRefFor(session._journalStreamRef, session._journalStreamMsgId, messageId);
   if (session._journalStreamRef && session._journalStreamRef !== nextRef) {
     // A new assistant message superseded the previous overlay WITHOUT its
@@ -657,11 +802,11 @@ function journalStream(session, messageId, replaceText) {
     // buffer was discarded unflushed (waitingForAnswer) or there was no
     // sendCallback to publish it. Clear, don't just drop: collapse the
     // orphaned overlay with a final empty replace_text.
-    journalPublisher.endStream(session.claudeSessionId, session._journalStreamRef, { clear: true });
+    journalPublisher.endStream(convoId, session._journalStreamRef, { clear: true });
   }
   session._journalStreamRef = nextRef;
   session._journalStreamMsgId = messageId;
-  journalPublisher.stream(session.claudeSessionId, nextRef, replaceText);
+  journalPublisher.stream(convoId, nextRef, replaceText);
 }
 
 // Retire a still-open streaming overlay that was NOT already retired by a
@@ -676,12 +821,13 @@ function journalStream(session, messageId, replaceText) {
 function journalStreamClear(session) {
   if (!JOURNAL_ENABLED) return;
   session._journalDurableRef = null;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const ref = session._journalStreamRef;
   if (!ref) return;
   session._journalStreamRef = null;
   session._journalStreamMsgId = null;
-  journalPublisher.endStream(session.claudeSessionId, ref, { clear: true });
+  journalPublisher.endStream(convoId, ref, { clear: true });
 }
 
 // Mirror a user's accepted prompt answer (button tap, numbered/lettered
@@ -696,6 +842,21 @@ function journalMirrorUserAnswer(session, text) {
   const body = typeof text === 'string' ? text.trim() : '';
   if (!body) return;
   journalPublishUserItem(session, 'publishText', { body, from: 'user' });
+}
+
+function recordUserAnswer(session, text, { mirrorToJournal = true } = {}) {
+  const body = typeof text === 'string' ? text.trim() : '';
+  if (!body) return;
+  recordConversationMessage(session, 'user', body);
+  if (mirrorToJournal) journalMirrorUserAnswer(session, body);
+}
+
+function reportPromptAnswerDeliveryFailure(session, error) {
+  const detail = error?.message || String(error || 'unknown error');
+  const message = `Could not deliver the prompt answer to Claude: ${detail}`;
+  debug(message);
+  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+  else if (session.sendCallback) session.sendCallback(message);
 }
 
 // Mirror a media upload the user just sent into the journal, once it has been
@@ -734,7 +895,7 @@ function journalMirrorUserMedia(session, { buffer, mime, name, dims }) {
 // (with whatever title we've learned so far, if any) and replays anything
 // buffered while we didn't yet know the convo_id, in order.
 function journalFlushForSession(session) {
-  const convoId = session.claudeSessionId;
+  const convoId = journalConvoIdFor(session);
   if (!convoId) return;
   session._journalConvoEstablished = true;
   journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
@@ -748,6 +909,12 @@ function journalFlushForSession(session) {
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const persistedMode = getPersistedSession(roomId);
+  const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  if (agent === AGENT_CODEX) {
+    const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
+    journalSeedTitle(codexSession);
+    return codexSession;
+  }
   const interactive = resolveInteractive({
     option: options.interactive,
     persisted: persistedMode?.interactiveMode,
@@ -801,7 +968,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       },
     }),
   ];
-  const printModel = resolveModel({ option: options.model, persisted: persistedMode?.model });
+  const printModel = options.model === null
+    ? undefined
+    : resolveModel({ option: options.model, persisted: persistedMode?.model });
   if (printModel) {
     args.push('--model', printModel);
   }
@@ -839,6 +1008,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
 
   const session = {
+    agent: AGENT_CLAUDE,
     proc,
     roomId,
     workdir: cwd,
@@ -855,6 +1025,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: resumeSessionId || null,
+    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || resumeSessionId || null,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
+    _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
     toolCalls: [], // collected tool indicators for this turn
@@ -864,7 +1037,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
-    currentModel: null,
+    currentModel: printModel || null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -948,7 +1121,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
         // without the user's --browser opt-in.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, {
+          agent: session.agent,
+          model: session.currentModel || undefined,
+          mcpExtras: session.mcpExtras,
+          journalConvoId: session.journalConvoId,
+        });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -961,6 +1139,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.chatHistory = session.chatHistory;
+        restarted.pinnedSummaryText = session.pinnedSummaryText;
+        restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted._agentHistoryCursor = session._agentHistoryCursor;
+        restarted._pendingAgentHandoff = session._pendingAgentHandoff;
+        restarted._agentSessions = session._agentSessions;
+        restarted.totalUsage = session.totalUsage;
+        restarted.turnCount = session.turnCount;
         // Carry journal-mirror state too: traffic buffered before the first
         // session_id arrived would otherwise be silently dropped, keeping
         // _journalState preserves the change-dedup across the restart, and
@@ -1012,6 +1198,266 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   return session;
 }
 
+// --- Codex programmatic sessions ---
+//
+// Codex's stable non-interactive contract is one `codex exec --json` process
+// per turn. The CodexExecSession adapter retains the thread ID and starts a
+// fresh child for each message; this wrapper presents the same logical session
+// shape the rest of the bridge expects from Claude's long-lived process.
+function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
+  const cwd = expandHome(workdir || DEFAULT_WORKDIR);
+  const persisted = getPersistedSession(roomId);
+  const historyLength = Array.isArray(persisted?.chatHistory) ? persisted.chatHistory.length : 0;
+  const persistedCodexState = getPersistedAgentState(persisted, AGENT_CODEX, historyLength);
+  const model = options.model === null
+    ? undefined
+    : (options.model ?? persistedCodexState.model ?? undefined);
+  const codex = new CodexExecSession({
+    cwd,
+    threadId: resumeSessionId || null,
+    model,
+    sandbox: CODEX_SANDBOX_MODE,
+    developerInstructions: CODEX_BRIDGE_PROMPT,
+    env: { ...process.env },
+  });
+
+  const session = {
+    agent: AGENT_CODEX,
+    codex,
+    proc: null,
+    roomId,
+    workdir: cwd,
+    mcpExtras: [],
+    responseBuffer: '',
+    sendCallback: null,
+    pendingPlan: null,
+    pendingPlanDenialId: null,
+    sendHtml: null,
+    sendButtonMessage: null,
+    showWorking: false,
+    showBashOutput: false,
+    alive: true,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+    restartCount: 0,
+    // Kept under the historical property name for compatibility with the
+    // journal protocol and existing persistence/routing code.
+    claudeSessionId: resumeSessionId || null,
+    journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || null,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persisted?.agentSessions),
+    _agentHistoryCursor: 0,
+    busy: false,
+    lineBuf: '',
+    toolCalls: [],
+    waitingForAnswer: null,
+    originRoomId: null,
+    firstMessageCaptured: false,
+    initData: null,
+    currentModel: model || null,
+    totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
+    turnCount: 0,
+    chatHistory: [],
+    pinnedSummaryEventId: null,
+    pinnedSummaryText: '',
+    _codexTurnFinished: true,
+    _codexLastError: null,
+  };
+
+  codex.on('spawn', ({ child, args }) => {
+    session.proc = child;
+    session._codexTurnFinished = false;
+    session._codexLastError = null;
+    session._codexCompletedUsage = null;
+    debug(`Spawning codex with args: ${args.join(' ')}`);
+    debug(`Working directory: ${cwd}`);
+  });
+  codex.on('event', event => {
+    debug('Codex event:', JSON.stringify(event));
+    handleCodexEvent(session, event);
+  });
+  codex.on('parse-error', ({ line }) => debug('Failed to parse Codex JSON line:', line));
+  codex.on('spawn-error', error => {
+    session._codexLastError = error?.message || String(error);
+  });
+  codex.on('turn-exit', ({ code, signal, stderr, sawTurnCompleted }) => {
+    session.proc = null;
+    if (session._codexTurnFinished) return;
+    if (!session.alive) {
+      // killSession normally performs this synchronously so a replacement
+      // session cannot inherit running/thinking state. Keep an exit-side
+      // fallback for any future path that marks the session dead directly.
+      finishCodexTurn(session, {
+        usage: session._codexCompletedUsage,
+        discardOutput: true,
+      });
+      return;
+    }
+    const interrupted = session._codexInterrupted;
+    session._codexInterrupted = false;
+    if (interrupted) {
+      finishCodexTurn(session, { error: 'Codex turn interrupted.' });
+      return;
+    }
+    if (!sawTurnCompleted || code !== 0) {
+      const detail = session._codexLastError || stderr ||
+        `Codex exited with ${signal ? `signal ${signal}` : `code ${code}`}`;
+      finishCodexTurn(session, { error: detail, usage: session._codexCompletedUsage });
+      return;
+    }
+    finishCodexTurn(session, { usage: session._codexCompletedUsage });
+  });
+
+  session.resetTimeout = () => {};
+  sessions.set(roomId, session);
+  return session;
+}
+
+function codexToolIndicator(item) {
+  if (!item || typeof item !== 'object') return null;
+  if (item.type === 'command_execution') {
+    const command = typeof item.command === 'string' ? item.command : JSON.stringify(item.command || 'command');
+    return `🔧 ${command}`;
+  }
+  if (item.type === 'web_search') return `🌐 ${item.query || 'Web search'}`;
+  if (item.type === 'mcp_tool_call') {
+    const name = [item.server, item.tool].filter(Boolean).join('/') || item.name || 'MCP tool';
+    return `🔌 ${name}`;
+  }
+  if (item.type === 'file_change') {
+    const paths = Array.isArray(item.changes)
+      ? item.changes.map(change => change?.path).filter(Boolean)
+      : [];
+    return `✏️ ${paths.length ? paths.join(', ') : 'Files changed'}`;
+  }
+  return null;
+}
+
+function handleCodexEvent(session, event) {
+  switch (event?.type) {
+    case 'thread.started': {
+      if (!event.thread_id) break;
+      const nativeIdChanged = session.claudeSessionId !== event.thread_id;
+      const journalIdMissing = !session.journalConvoId;
+      if (nativeIdChanged || journalIdMissing) {
+        session.claudeSessionId = event.thread_id;
+        if (!session.journalConvoId) session.journalConvoId = event.thread_id;
+        persistSession(session.roomId, event.thread_id, session.workdir, session.originRoomId, {
+          chatHistory: session.chatHistory,
+          model: session.currentModel || null,
+        });
+        if (nativeIdChanged) {
+          console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
+        }
+        if (journalIdMissing) journalFlushForSession(session);
+      }
+      break;
+    }
+
+    case 'item.started': {
+      const indicator = codexToolIndicator(event.item);
+      if (indicator) {
+        session.toolCalls.push(indicator);
+        journalActivity(session, 'tool', truncateActivityDetail(indicator));
+      }
+      break;
+    }
+
+    case 'item.completed': {
+      const item = event.item || {};
+      if (item.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) {
+        session.responseBuffer += (session.responseBuffer ? '\n\n' : '') + item.text;
+      }
+      if (codexToolIndicator(item) && session._journalActivityState === 'tool') {
+        journalActivity(session, 'thinking');
+      }
+      break;
+    }
+
+    case 'turn.completed': {
+      // Wait for the child to close before clearing busy/flushing the queue.
+      // codex exec has emitted its result but still owns the adapter's one
+      // process slot until then; starting the next queued turn here races and
+      // gets rejected as "busy".
+      session._codexCompletedUsage = event.usage || null;
+      break;
+    }
+
+    case 'turn.failed': {
+      const detail = event.error?.message || event.error || event.message || 'Codex turn failed.';
+      session._codexLastError = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      session._codexCompletedUsage = event.usage || null;
+      break;
+    }
+
+    case 'error': {
+      const detail = event.message || event.error?.message || event.error;
+      if (detail) session._codexLastError = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+function flushPendingSessionQueue(session) {
+  if (!session.alive || !session.queuedMessages?.length) return false;
+  const queued = session.queuedMessages;
+  session.queuedMessages = null;
+  const summary = formatQueueSummary(queued);
+  if (session.sendHtml) {
+    session.sendHtml(
+      `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
+      `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
+    );
+  } else if (session.sendCallback) {
+    session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+  }
+  flushQueue(session, queued);
+  return true;
+}
+
+function finishCodexTurn(session, {
+  error = null,
+  usage = null,
+  discardOutput = false,
+  preserveQueue = false,
+} = {}) {
+  if (session._codexTurnFinished) return;
+  session._codexTurnFinished = true;
+  session.turnCount++;
+
+  if (usage) {
+    session.totalUsage.input_tokens += usage.input_tokens || 0;
+    session.totalUsage.output_tokens += usage.output_tokens || 0;
+    session.totalUsage.cache_read += usage.cached_input_tokens || 0;
+  }
+
+  if (!discardOutput) {
+    if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+      for (const chunk of splitMessage(session.toolCalls.join('\n'))) session.sendCallback(chunk);
+    }
+    flushResponse(session);
+  } else {
+    session.responseBuffer = '';
+  }
+  session.toolCalls = [];
+  journalStreamClear(session);
+  session.busy = false;
+  journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
+  journalStatus(session);
+  if (!preserveQueue) clearQueueNotifications(session);
+
+  if (!discardOutput && error && session.alive) {
+    const message = `⚠️ ${error}`;
+    if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+    else if (session.sendCallback) session.sendCallback(message);
+  }
+
+  if (!preserveQueue) flushPendingSessionQueue(session);
+}
+
 // --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
 //
 // Spawns claude in a PTY instead of --print. Events come from the on-disk
@@ -1027,7 +1473,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const sessionId = resumeSessionId || randomUUID();
-  const model = resolveModel({ option: options.model, persisted: persistedForRoom?.model });
+  const model = options.model === null
+    ? undefined
+    : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
   const settings = {
     hooks: {
@@ -1098,6 +1546,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // call sites that need raw input go via session.iv.sendText / sendKeystroke
   // (wired up in Task 4.2).
   const session = {
+    agent: AGENT_CLAUDE,
     proc: null,
     iv,
     roomId,
@@ -1116,6 +1565,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: sessionId,
+    journalConvoId: options.journalConvoId || persistedForRoom?.journalConvoId || sessionId,
+    _agentSessions: mergeAgentStates({}, options.agentSessions || persistedForRoom?.agentSessions),
+    _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
     toolCalls: [],
@@ -1123,7 +1575,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     originRoomId: null,
     firstMessageCaptured: false,
     initData: null,
-    currentModel: null,
+    currentModel: model || null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -1207,7 +1659,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, {
+          agent: session.agent,
+          model: session.currentModel || undefined,
+          mcpExtras: session.mcpExtras,
+          journalConvoId: session.journalConvoId,
+        });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -1220,6 +1677,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.chatHistory = session.chatHistory;
+        restarted.pinnedSummaryText = session.pinnedSummaryText;
+        restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted._agentHistoryCursor = session._agentHistoryCursor;
+        restarted._pendingAgentHandoff = session._pendingAgentHandoff;
+        restarted._agentSessions = session._agentSessions;
+        restarted.totalUsage = session.totalUsage;
+        restarted.turnCount = session.turnCount;
         // Carry journal-mirror state (see the matching print-mode block).
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
@@ -1465,7 +1930,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
   const trimmed = (userText || '').trim().toLowerCase();
-  const mirrorAnswer = (text) => { if (mirrorToJournal) journalMirrorUserAnswer(session, text); };
+  const mirrorAnswer = (text) => recordUserAnswer(session, text, { mirrorToJournal });
 
   // Confirm to the Matrix user what we sent on their behalf (without this the
   // consumption is invisible) and start a typing indicator for the next render.
@@ -1486,14 +1951,16 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     const ftResponse = p.kind === 'arrow-menu'
       ? { kind: 'arrow-menu', key: String(idx) }
       : { kind: p.kind, key: opt.key };
-    session.pendingInteractivePrompt = null;
-    session.iv.respondToPrompt(ftResponse);
-    // The reply goes in via iv.sendText below (not sendToSession), so mirror
-    // the user's answer here — this covers both routeFreeText call sites.
-    mirrorAnswer(replyText);
-    setTimeout(() => {
-      if (session.iv && session.iv.alive) session.iv.sendText(replyText);
-    }, 250);
+    const dispatched = sendDelayedPromptAnswer(session, {
+      response: ftResponse,
+      text: replyText,
+      // The reply goes in via iv.sendText (not sendToSession), so record it
+      // only after that delayed PTY send accepts the text.
+      onDelivered: () => mirrorAnswer(replyText),
+      onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
+    });
+    if (dispatched) session.pendingInteractivePrompt = null;
+    return dispatched;
   };
 
   // yes-no: a binary confirm with no option list or free-text slot.
@@ -1502,9 +1969,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     if (/^(y|yes|1)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'y' }; label = 'Yes'; }
     else if (/^(n|no|2)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'n' }; label = 'No'; }
     if (!response) { session.pendingInteractivePrompt = null; return false; }
-    session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving yes-no prompt reply="${userText}" → key=${response.key}`);
-    session.iv.respondToPrompt(response);
+    if (session.iv.respondToPrompt(response) !== true) return false;
+    session.pendingInteractivePrompt = null;
     mirrorAnswer(label);
     ack(label);
     return true;
@@ -1535,18 +2002,20 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
       // reply ("1. also use compiled css…") already names the option.
       if (hasFreeText) {
         console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} + remark via free-text slot`);
-        routeFreeText(userText);
-        ack(opt.label, { numberPrefix, note: '(with your note)' });
-        return true;
+        if (routeFreeText(userText)) {
+          ack(opt.label, { numberPrefix, note: '(with your note)' });
+          return true;
+        }
+        return false;
       }
       // No free-text channel on this menu — the choice goes through but the
       // remark can't ride along. Send the pick and tell the user.
       const response = p.kind === 'arrow-menu'
         ? { kind: 'arrow-menu', key: String(optIdx) }
         : { kind: p.kind, key: opt.key };
-      session.pendingInteractivePrompt = null;
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
-      session.iv.respondToPrompt(response);
+      if (session.iv.respondToPrompt(response) !== true) return false;
+      session.pendingInteractivePrompt = null;
       mirrorAnswer(`${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
       return true;
@@ -1555,9 +2024,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
     const response = p.kind === 'arrow-menu'
       ? { kind: 'arrow-menu', key: String(optIdx) }
       : { kind: p.kind, key: opt.key };
-    session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
-    session.iv.respondToPrompt(response);
+    if (session.iv.respondToPrompt(response) !== true) return false;
+    session.pendingInteractivePrompt = null;
     mirrorAnswer(`${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
     return true;
@@ -1568,8 +2037,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
   // (prevents false-positive detections from blocking free-form messages).
   if (hasFreeText) {
     console.log(`[IV-DEBUG] Routing unmatched reply="${userText}" to free-text slot`);
-    routeFreeText(userText);
-    return true;
+    return routeFreeText(userText);
   }
   session.pendingInteractivePrompt = null;
   return false;
@@ -1907,9 +2375,6 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     session.busy = true;
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
-    // This answer goes in via a raw tool_result stdin write (not
-    // sendToSession), so mirror the user's side of it here.
-    if (mirrorToJournal) journalMirrorUserAnswer(session, answerText);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -1922,8 +2387,19 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       }
     }) + '\n';
     debug('Sending answer to stdin:', jsonMsg.trim());
-    session.proc.stdin.write(jsonMsg);
-    if (session.resetTimeout) session.resetTimeout();
+    writePromptAnswer(session, jsonMsg, {
+      // This answer goes in via a raw tool_result stdin write (not
+      // sendToSession), so record it only after stdin accepts the chunk.
+      onDelivered: () => {
+        recordUserAnswer(session, answerText, { mirrorToJournal });
+        if (session.resetTimeout) session.resetTimeout();
+      },
+      onError: (error) => reportSessionSendFailure(
+        session,
+        `Could not send the prompt answer to Claude: ${error.message}`,
+        { restoreJournalState: true },
+      ),
+    });
   }
 }
 
@@ -2074,6 +2550,7 @@ function handleClaudeEvent(session, event) {
   // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
+    if (!session.journalConvoId) session.journalConvoId = event.session_id;
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
     journalFlushForSession(session);
@@ -2279,7 +2756,8 @@ function handleClaudeEvent(session, event) {
               // (spec §9). Same skip-if-no-session-id rule as journalActivity:
               // ephemerals replayed late would be stale, so a session whose
               // claudeSessionId isn't known yet just doesn't stream.
-              if (JOURNAL_ENABLED && session.claudeSessionId) {
+              const journalConvoId = journalConvoIdFor(session);
+              if (JOURNAL_ENABLED && journalConvoId) {
                 // Cap once here so a pathological (~1 MiB) command can't blow
                 // past the server's 1 MiB WS payload cap in the offset-0
                 // frame's meta; the server truncates meta at 2000 chars
@@ -2288,13 +2766,13 @@ function handleClaudeEvent(session, event) {
                 const streamCommand = String(displayCommand).slice(0, 2000);
                 const pump = createToolStreamPump({
                   logPath: liveLogPath,
-                  convoId: session.claudeSessionId,
+                  convoId: journalConvoId,
                   messageRef: liveToolUseId,
                   meta: { tool: 'Bash', command: streamCommand },
                   streamAppend: (c, r, off, chunk, meta) =>
                     journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
-                const streamRegKey = toolStreamKey(session.claudeSessionId, liveToolUseId);
+                const streamRegKey = toolStreamKey(journalConvoId, liveToolUseId);
                 // Stop (never finalize — same message_ref, a finalize would
                 // collide) any prior pump still registered under this exact
                 // key before overwriting the Map entry: Map.set silently
@@ -2305,7 +2783,7 @@ function handleClaudeEvent(session, event) {
                 toolStreamPumps.set(streamRegKey, {
                   pump,
                   session,
-                  convoId: session.claudeSessionId,
+                  convoId: journalConvoId,
                   command: streamCommand,
                   logPath: liveLogPath,
                   messageRef: liveToolUseId,
@@ -2408,12 +2886,23 @@ function handleClaudeEvent(session, event) {
           console.log(`Resume failed for room ${session.roomId}: session not found, clearing stale ID`);
           session.claudeSessionId = null;
           session._resumeFailed = true;
-          // Remove stale persisted session so future !resume won't retry it
+          // Clear only this provider's stale native ID. A switched
+          // conversation may still have a valid session for the other
+          // provider plus the shared transcript and stable journal ID.
           const data = loadPersistedSessions();
-          delete data[String(session.roomId)];
+          const persisted = data[String(session.roomId)];
+          if (persisted?.agentSessions) {
+            persisted.sessionId = null;
+            persisted.agentSessions = mergeAgentStates(persisted.agentSessions, {
+              [session.agent]: { sessionId: null, historyCursor: 0, lastUsed: Date.now() },
+            });
+            data[String(session.roomId)] = persisted;
+          } else {
+            delete data[String(session.roomId)];
+          }
           savePersistedSessions(data);
           if (session.sendCallback) {
-            session.sendCallback('Previous session not found (expired or deleted). Send !start to begin a new session.');
+            session.sendCallback('Previous native session not found (expired or deleted). The next message will start this agent fresh; /switch can still return to the other agent.');
           }
           // Reset busy/typing so the session isn't stuck if claude exits 0
           // without our normal result-handling path running.
@@ -2691,8 +3180,9 @@ function handleClaudeEvent(session, event) {
             // there's no pump). Otherwise this ran on EVERY tool_result of
             // every tool — O(content) string work discarded whenever both are
             // absent, which is the common case.
-            const pumpRegistered = JOURNAL_ENABLED && session.claudeSessionId
-              && toolStreamPumps.has(toolStreamKey(session.claudeSessionId, block.tool_use_id));
+            const journalConvoId = journalConvoIdFor(session);
+            const pumpRegistered = JOURNAL_ENABLED && journalConvoId
+              && toolStreamPumps.has(toolStreamKey(journalConvoId, block.tool_use_id));
             let opts;
             if (entry || pumpRegistered) {
               const blockText = typeof block.content === 'string'
@@ -2778,6 +3268,58 @@ function extractTextContent(event) {
   return '';
 }
 
+function recordConversationMessage(session, role, text) {
+  const normalized = typeof text === 'string' ? text.trim() : '';
+  if (!normalized || (role !== 'user' && role !== 'assistant')) return;
+  if (!session.chatHistory) session.chatHistory = [];
+  session.chatHistory.push({
+    role,
+    text: normalized,
+    ...(role === 'assistant' && session.agent ? { agent: session.agent } : {}),
+  });
+  // Once a message is dispatched to, or emitted by, the active native
+  // session, that provider has seen the shared transcript through this item.
+  session._agentHistoryCursor = session.chatHistory.length;
+  debug(`Added ${role} message to chatHistory, length now: ${session.chatHistory.length}`);
+  persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+    chatHistory: session.chatHistory,
+  });
+}
+
+function applyPendingAgentHandoff(session, contentBlocks) {
+  const pending = session._pendingAgentHandoff;
+  if (!pending?.prompt) return { blocks: contentBlocks, pending: null };
+  return {
+    blocks: prependHandoffPrompt(contentBlocks, pending),
+    pending,
+  };
+}
+
+function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
+  if (historyText) recordConversationMessage(session, 'user', historyText);
+  if (pendingHandoff && session._pendingAgentHandoff === pendingHandoff) {
+    session._pendingAgentHandoff = null;
+    session._agentHistoryCursor = session.chatHistory?.length || pendingHandoff.toIndex || 0;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+      chatHistory: session.chatHistory || [],
+    });
+  }
+}
+
+function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
+  session.busy = false;
+  if (restoreJournalState) {
+    journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
+  }
+  // Callers use false to decide whether dispatch-dependent work (history,
+  // media mirroring, naming) may run. Surface the specific failure here
+  // because the journal-only input path has no transport-level fallback.
+  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+  else if (session.sendCallback) session.sendCallback(message);
+  return false;
+}
+
 function flushResponse(session) {
   let text = session.responseBuffer.trim();
   session.responseBuffer = '';
@@ -2799,13 +3341,7 @@ function flushResponse(session) {
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
-    if (!session.chatHistory) session.chatHistory = [];
-    session.chatHistory.push({ role: 'assistant', text: cleanText });
-    debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
-    // Persist chatHistory for resume across restarts
-    if (session.claudeSessionId) {
-      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-    }
+    recordConversationMessage(session, 'assistant', cleanText);
     // Update room name and pinned summary after adding message
     maybeUpdatePinnedSummary(session);
   }
@@ -2840,6 +3376,40 @@ function flushResponse(session) {
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
 
+  const historyText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  const journalText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n\n')
+    .trim();
+
+  // Interactive PTY input cannot deliver non-text-only turns. Reject before
+  // the resume outbox and, crucially, before prepending a pending provider
+  // handoff; otherwise the synthetic handoff becomes the only sendable text,
+  // is consumed as a standalone turn, and the user's attachment is dropped.
+  if (session.iv && !historyText) {
+    const nonTextCount = contentBlocks.filter(block => block?.type !== 'text').length;
+    const message = nonTextCount > 0
+      ? `Can't send ${nonTextCount} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`
+      : 'Interactive mode needs a text prompt.';
+    return reportSessionSendFailure(session, message);
+  }
+
+  // Reject unsupported Codex inputs before changing activity state or
+  // journaling them. A false return is important: callers gate chat history,
+  // media mirroring, and first-message naming on actual dispatch.
+  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
+    return reportSessionSendFailure(
+      session,
+      'Codex programmatic mode needs a text prompt or a saved-file path.',
+    );
+  }
+
   // Resume-hold gate: while a just-resumed iv session isn't input-ready yet,
   // buffer outgoing messages instead of typing them into the still-loading
   // TUI. The readiness watcher (startResumeReadyWatcher) flushes them, merged
@@ -2861,13 +3431,10 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.busy = true;
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
-  // Mirror the user's side of the conversation into the journal. This is the
-  // single choke point every real inbound message flows through (directly for
-  // media, via sendTextToSession for plain text), so a message is mirrored
-  // exactly once here regardless of caller.
-  if (!skipJournalMirror) {
-    const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
-    if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
+  // Mirror Claude input here. Codex input is mirrored below only after its
+  // one-process-per-turn adapter confirms that it accepted the dispatch.
+  if (!skipJournalMirror && session.agent !== AGENT_CODEX && journalText) {
+    journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
   }
 
   // /context-full is a bridge-only command — claude itself knows only
@@ -2885,6 +3452,30 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     }
   }
 
+  const preparedHandoff = applyPendingAgentHandoff(session, contentBlocks);
+  contentBlocks = preparedHandoff.blocks;
+
+  if (session.agent === AGENT_CODEX) {
+    // codex exec accepts one text prompt per process. Media builders always
+    // include an absolute-path text annotation; binary/base64 blocks are
+    // intentionally omitted here because Codex can inspect the saved file.
+    const sent = session.codex?.send(contentBlocks) === true;
+    if (sent) {
+      commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
+      if (!skipJournalMirror && journalText) {
+        journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
+      }
+    }
+    if (!sent) {
+      const detail = session.codex?.lastError?.message || session._codexLastError;
+      const message = detail
+        ? `Could not start Codex: ${detail}`
+        : 'Codex could not accept the message. Try again or restart the session.';
+      return reportSessionSendFailure(session, message, { restoreJournalState: true });
+    }
+    return true;
+  }
+
   if (session.iv) {
     // Interactive mode: type text blocks into the PTY. Non-text content
     // (images, encoded attachments) is not currently supportable via PTY
@@ -2898,21 +3489,18 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
       session.iv.sendText(text);
+      commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }
-    // Nothing to send (all blocks were non-text and got dropped). Don't
-    // leave the session in `busy=true` with a stuck typing indicator —
-    // no claude turn means no Stop hook to clear them.
-    session.busy = false;
-    // Tell the user what happened directly. Returning true so the caller's
-    // generic "Session is not available" fallback doesn't fire — the
-    // session IS alive, we just can't forward non-text content through the
-    // PTY yet (Phase 6 will add image handling via a side channel).
-    const msg = `Can't send ${nonText.length} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`;
-    if (session.sendHtml) session.sendHtml(msg, escapeHtml(msg));
-    else if (session.sendCallback) session.sendCallback(msg);
-    return true;
+    // Defensive fallback: validation above should make this unreachable, but
+    // preserve false/handled semantics if a future content rewrite removes
+    // all text after activity state has started.
+    return reportSessionSendFailure(
+      session,
+      'Interactive mode needs a text prompt.',
+      { restoreJournalState: true },
+    );
   }
 
   const jsonMsg = JSON.stringify({
@@ -2925,7 +3513,17 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   debug('Sending to stdin:', jsonMsg.length > 1000
     ? jsonMsg.slice(0, 500) + `... [${jsonMsg.length} chars total]`
     : jsonMsg.trim());
-  session.proc.stdin.write(jsonMsg);
+  try {
+    session.proc.stdin.write(jsonMsg);
+  } catch (error) {
+    debug(`Failed to write Claude turn: ${error.message}`);
+    return reportSessionSendFailure(
+      session,
+      `Could not send the message to Claude: ${error.message}`,
+      { restoreJournalState: true },
+    );
+  }
+  commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
   if (session.resetTimeout) session.resetTimeout();
   return true;
 }
@@ -3095,6 +3693,18 @@ function dispatchMergedFlush(session, queued) {
 }
 
 function flushQueue(session, queued) {
+  if (session.agent === AGENT_CODEX && session.busy) {
+    // Claude's stream-json stdin can accept a forced follow-up while the
+    // current process is alive; codex exec cannot. Preserve the detached
+    // batch, interrupt the active child, and let finishCodexTurn dispatch it
+    // after that child has exited and released the adapter's process slot.
+    session.queuedMessages = [...(session.queuedMessages || []), ...queued];
+    session._codexInterrupted = true;
+    if (session.codex?.interrupt('SIGINT')) return;
+    session._codexInterrupted = false;
+    console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
+    return;
+  }
   if (!dispatchMergedFlush(session, queued)) {
     console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
   }
@@ -3339,8 +3949,9 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
       if (ref) {
         payload.message_ref = ref;
         journalSession._journalDurableRef = null;
-        if (journalSession.claudeSessionId) {
-          journalPublisher.endStream(journalSession.claudeSessionId, ref);
+        const convoId = journalConvoIdFor(journalSession);
+        if (convoId) {
+          journalPublisher.endStream(convoId, ref);
         }
         journalSession._journalStreamRef = null;
         journalSession._journalStreamMsgId = null;
@@ -3473,8 +4084,9 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
 }
 
 function stopAndFinalizeToolStream(session, toolUseId, opts = {}) {
-  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
-  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  const convoId = journalConvoIdFor(session);
+  if (!JOURNAL_ENABLED || !convoId) return;
+  const key = toolStreamKey(convoId, toolUseId);
   const entry = toolStreamPumps.get(key);
   if (!entry) return; // not a streamed command, or already finalized
   finalizeToolStreamEntry(key, entry, opts);
@@ -3787,8 +4399,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
-      const arg = positional[0];
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const agentFlags = extractAgentFlag(afterMcp);
+      if (agentFlags.error) {
+        await sendReply(agentFlags.error);
+        return;
+      }
+      const selectedAgent = resolveAgent({ option: agentFlags.agent, fallback: DEFAULT_AGENT });
+      if (selectedAgent === AGENT_CODEX && mcpExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
+        return;
+      }
+      const arg = agentFlags.rest[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -3815,7 +4437,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -3832,7 +4454,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in a new conversation${extrasNote}.`);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}.`);
       break;
     }
 
@@ -3844,6 +4466,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       killSession(session);
       sessions.delete(roomId);
+      journalSessionState(session, 'done');
+      journalActivity(session, 'idle');
       journalEvictConvoInput(session);
       await sendReply('Session stopped.');
       break;
@@ -3860,20 +4484,33 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // session ID. Passing no flags preserves whatever extras the session
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
-      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const restartAgentFlags = extractAgentFlag(restartAfterMcp);
+      if (restartAgentFlags.error) {
+        await sendReply(restartAgentFlags.error);
+        return;
+      }
+      if (restartAgentFlags.agent && restartAgentFlags.agent !== existing.agent) {
+        await sendReply(`A ${agentLabel(existing.agent)} conversation can't be resumed by ${agentLabel(restartAgentFlags.agent)}. Use /start --${restartAgentFlags.agent} for a new conversation.`);
+        return;
+      }
+      if (existing.agent === AGENT_CODEX && restartFlagExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
+        return;
+      }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
-      await sendReply('🔄 Restarting session...');
+      await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
       await sendReply(
-        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
       );
       break;
     }
@@ -3884,73 +4521,170 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeTokens } = extractMcpExtraFlags(parts.slice(1));
-      const resumeArg = resumeTokens[0]?.replace(/\.+$/, '') || undefined;
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
+      if (resumeAgentFlags.error) {
+        await sendReply(resumeAgentFlags.error);
+        return;
+      }
+      const resumeArg = resumeAgentFlags.rest[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
         // No arg — show sessions list inline
-        await handleCommand(roomId, '!sessions', sendReply, sendHtml, sender);
+        const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
+        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
         return;
       }
 
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
-      const encodedPath = resumeWorkdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-      if (!(await pathExists(projectDir))) {
-        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
-        return;
-      }
-
-      // Async id resolution (issue #102): the old inline version ran a
-      // synchronous readdir and then a synchronous stat INSIDE the sort
-      // comparator — O(n log n) blocking metadata calls on the event loop.
-      // Same ordering and fallbacks, one stat per file, via fs.promises
-      // (lib/session-summary.js; the no-sync-fs pin lives in
-      // test/session-summary.test.js's source-inspection block).
-      const files = await listSessionIdsByMtime(projectDir);
-
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
+      let resumePersisted = null;
+      let selectedAgent = resolveAgent({
+        option: resumeAgentFlags.agent,
+        persisted: currentSession?.agent || prev?.agent,
+        fallback: DEFAULT_AGENT,
+      });
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-      if (!isNaN(num) && num >= 1 && num <= files.length) {
-        resumeSessionId = files[num - 1];
-      } else {
-        const match = files.find(f => f.startsWith(resumeArg));
-        if (match) {
-          resumeSessionId = match;
-        } else {
-          // Session not found in current workdir — check persisted sessions for a different workdir
-          const allPersisted = loadPersistedSessions();
-          let foundEntry = null;
-          for (const entry of Object.values(allPersisted)) {
-            if (entry.sessionId && entry.sessionId.startsWith(resumeArg) && entry.workdir && entry.workdir !== resumeWorkdir) {
-              foundEntry = entry;
-              break;
-            }
+      const rejectAmbiguousResume = async () => {
+        await sendReply(
+          `Session prefix ${resumeArg} matches multiple sessions. Use a longer ID and specify --claude or --codex.`,
+        );
+      };
+
+      // An explicit ID prefix can identify a persisted Codex thread even
+      // when the caller omitted --codex. Numeric selection remains scoped to
+      // the selected/default agent because numbers are list-relative.
+      if (!resumeAgentFlags.agent && isNaN(num)) {
+        const codexMatches = matchSessionIdPrefix(
+          listPersistedAgentSessions(AGENT_CODEX),
+          resumeArg,
+        ).matches;
+        const persistedClaudeMatches = matchSessionIdPrefix(
+          listPersistedAgentSessions(AGENT_CLAUDE),
+          resumeArg,
+        ).matches;
+        const inferredClaudeDir = path.join(
+          os.homedir(),
+          '.claude',
+          'projects',
+          resumeWorkdir.replace(/\//g, '-'),
+        );
+        const localClaudeMatches = await pathExists(inferredClaudeDir)
+          ? matchSessionIdPrefix(await listSessionIdsByMtime(inferredClaudeDir), resumeArg).matches
+          : [];
+        const claudeMatches = new Set([
+          ...localClaudeMatches,
+          ...persistedClaudeMatches.map(entry => entry.sessionId),
+        ]);
+        if (codexMatches.length + claudeMatches.size > 1) {
+          await rejectAmbiguousResume();
+          return;
+        }
+        if (codexMatches.length === 1) selectedAgent = AGENT_CODEX;
+        else if (claudeMatches.size === 1) selectedAgent = AGENT_CLAUDE;
+      }
+
+      if (selectedAgent === AGENT_CODEX) {
+        if (resumeExtras.length > 0) {
+          await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
+          return;
+        }
+        const localEntries = listPersistedAgentSessions(AGENT_CODEX, resumeWorkdir);
+        if (!isNaN(num)) {
+          if (num < 1 || num > localEntries.length) {
+            await sendReply(`Codex session number not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
+            return;
           }
-          if (foundEntry) {
+          resumePersisted = localEntries[num - 1];
+        } else {
+          const resolution = matchSessionIdPrefix(
+            listPersistedAgentSessions(AGENT_CODEX),
+            resumeArg,
+          );
+          if (resolution.ambiguous) {
+            await rejectAmbiguousResume();
+            return;
+          }
+          resumePersisted = resolution.match;
+        }
+        if (!resumePersisted) {
+          await sendReply(`Codex session not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
+          return;
+        }
+        resumeSessionId = resumePersisted.sessionId;
+        actualWorkdir = resumePersisted.workdir || resumeWorkdir;
+      } else {
+        const encodedPath = resumeWorkdir.replace(/\//g, '-');
+        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+        // Async id resolution (issue #102): metadata is statted once per
+        // transcript and sorted without synchronous work in the comparator.
+        // A missing current-workdir directory is not terminal for an ID
+        // lookup: bridge persistence may point to the transcript's original
+        // workdir. Numeric selections remain scoped to the current workdir.
+        const files = await pathExists(projectDir)
+          ? await listSessionIdsByMtime(projectDir)
+          : [];
+        if (!isNaN(num)) {
+          if (num < 1 || num > files.length) {
+            await sendReply(`Claude session number not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
+            return;
+          }
+          resumeSessionId = files[num - 1];
+        } else {
+          const currentMatches = matchSessionIdPrefix(files, resumeArg).matches;
+          const persistedMatches = matchSessionIdPrefix(
+            listPersistedAgentSessions(AGENT_CLAUDE),
+            resumeArg,
+          ).matches;
+          const candidateIds = new Set([
+            ...currentMatches,
+            ...persistedMatches.map(entry => entry.sessionId),
+          ]);
+          if (candidateIds.size > 1) {
+            await rejectAmbiguousResume();
+            return;
+          }
+          const matchId = [...candidateIds][0] || null;
+          const foundEntry = persistedMatches.find(entry => entry.sessionId === matchId) || null;
+          if (matchId && currentMatches.includes(matchId)) {
+            resumeSessionId = matchId;
+            resumePersisted = foundEntry;
+          } else if (matchId && foundEntry?.workdir) {
             const altEncoded = foundEntry.workdir.replace(/\//g, '-');
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
             if (await pathExists(altFile)) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
+              resumePersisted = foundEntry;
             }
           }
           if (!resumeSessionId) {
-            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+            await sendReply(`Claude session not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
             return;
           }
         }
       }
 
-      // Check if there's already an active room for this Claude session
+      // Resolve the bridge-owned record by provider-specific state before
+      // checking live rooms or creating a replacement room. The top-level
+      // sessionId only names whichever provider was active when that record
+      // was last written; the requested native ID may live in agentSessions.
+      resumePersisted ||= findPersistedAgentSession(selectedAgent, resumeSessionId);
+      const resumeConvoId = resumePersisted?.journalConvoId || null;
+
+      // Check if there's already an active room for this agent session.
       for (const activeSession of sessions.values()) {
         if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
           await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active in another conversation.`);
+          return;
+        }
+        if (resumeConvoId && journalConvoIdFor(activeSession) === resumeConvoId && activeSession.alive) {
+          await sendReply(`Conversation ${resumeConvoId.slice(0, 8)}… is already active in another room.`);
           return;
         }
       }
@@ -3959,7 +4693,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionRoomId = newSessionConvoId();
 
       const shortId = resumeSessionId.slice(0, 8);
-      const summary = await getSessionSummary(resumeSessionId, actualWorkdir);
+      const summary = selectedAgent === AGENT_CODEX
+        ? (resumePersisted?.summary || '')
+        : await getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
@@ -3972,29 +4708,70 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
       // resume "just work" if /start --browser was used originally.
-      const resumePersisted = getPersistedSession(sessionRoomId) || (resumeSessionId
-        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
-        : null);
+      const resumeHistory = Array.isArray(resumePersisted?.chatHistory)
+        ? resumePersisted.chatHistory
+        : [];
+      const resumeState = getPersistedAgentState(
+        resumePersisted,
+        selectedAgent,
+        resumeHistory.length,
+      );
+      const inheritedAgentSessions = mergeAgentStates(resumePersisted?.agentSessions, {
+        [selectedAgent]: {
+          ...resumeState,
+          sessionId: resumeSessionId,
+        },
+      });
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
-        : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
-      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras });
+        : resumeState.mcpExtras;
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
+        agent: selectedAgent,
+        model: resumeState.model,
+        mcpExtras: effectiveResumeExtras,
+        journalConvoId: resumePersisted?.journalConvoId,
+        agentSessions: inheritedAgentSessions,
+        ...(selectedAgent === AGENT_CLAUDE
+          ? { interactive: resumeState.interactiveMode }
+          : {}),
+      });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
+      session.chatHistory = resumeHistory;
+      session.pinnedSummaryText = resumePersisted?.pinnedSummaryText || '';
+      session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      session._agentSessions = inheritedAgentSessions;
+      hydrateAgentState(session, {
+        ...(resumePersisted || {}),
+        agent: selectedAgent,
+        agentSessions: inheritedAgentSessions,
+      });
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
 
-      // Persist immediately — we already know the session ID, don't wait for Claude's event
-      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
+      // Persist immediately — we already know the agent session ID.
+      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId, {
+        agent: selectedAgent,
+        agentSessions: inheritedAgentSessions,
+        journalConvoId: session.journalConvoId,
+        chatHistory: session.chatHistory,
+        pinnedSummaryText: session.pinnedSummaryText,
+        pinnedSummaryEventId: session.pinnedSummaryEventId,
+        model: session.currentModel || null,
+        interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
+        mcpExtras: session.mcpExtras,
+        totalUsage: session.totalUsage,
+        turnCount: session.turnCount,
+      });
 
-      await sendReply(`Resuming session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
+      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
-        `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
+        `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
         `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
@@ -4007,8 +4784,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirTokens } = extractMcpExtraFlags(parts.slice(1));
-      const newDir = workdirTokens.join(' ');
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
+      if (workdirAgentFlags.error) {
+        await sendReply(workdirAgentFlags.error);
+        return;
+      }
+      const selectedAgent = resolveAgent({ option: workdirAgentFlags.agent, fallback: DEFAULT_AGENT });
+      if (selectedAgent === AGENT_CODEX && workdirExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
+        return;
+      }
+      const newDir = workdirAgentFlags.rest.join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
         const current = session?.workdir || DEFAULT_WORKDIR;
@@ -4037,7 +4824,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, resolved, undefined, { mcpExtras: workdirExtras });
+      const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -4046,12 +4833,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      await sendReply(`Session started in a new conversation.\nWorkdir: ${resolved}`);
-      const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation.\nWorkdir: ${resolved}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
-        `<b>Session started</b><br/>` +
+        `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
         `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
-        `<i>Send any message to interact with Claude Code.</i>`;
+        `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
     }
@@ -4067,7 +4854,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
-        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
 
       const busyHtml = session.busy
@@ -4076,12 +4863,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const htmlStatus =
         `<b>Session Status</b><table>` +
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
+        `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
         `</table>`;
 
       await sendHtml(plainStatus, htmlStatus);
@@ -4109,6 +4897,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Live Bash tee output is a Claude-hook feature and is not available in Codex programmatic mode.');
+        break;
+      }
       session.showBashOutput = !session.showBashOutput;
       // Persist so !restart re-reads the value at spawn. Gated like the
       // pendingPlanDenialId persist at the ExitPlanMode handler — passing a
@@ -4124,23 +4916,38 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
-
-      const encodedPath = workdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-      if (!(await pathExists(projectDir))) {
-        await sendReply('No sessions found for this workdir.');
+      const sessionAgentFlags = extractAgentFlag(parts.slice(1));
+      if (sessionAgentFlags.error) {
+        await sendReply(sessionAgentFlags.error);
         break;
       }
+      if (sessionAgentFlags.rest.length > 0) {
+        await sendReply('Usage: /sessions [--claude|--codex]');
+        break;
+      }
+      const selectedAgent = resolveAgent({
+        option: sessionAgentFlags.agent,
+        persisted: currentSession?.agent || prev?.agent,
+        fallback: DEFAULT_AGENT,
+      });
 
-      // Bounded listing (lib/session-summary.js): stat + sort by mtime
-      // first, then read summaries — bounded head chunks, via fs.promises —
-      // for ONLY the 15 newest, instead of the old synchronous whole-file
-      // read of every transcript in the dir.
-      const items = await listSessionSummaries(projectDir, { limit: 15 });
+      let items;
+      if (selectedAgent === AGENT_CODEX) {
+        items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+      } else {
+        const encodedPath = workdir.replace(/\//g, '-');
+        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+        if (!(await pathExists(projectDir))) {
+          await sendReply('No Claude sessions found for this workdir.');
+          break;
+        }
+        // Bounded listing (lib/session-summary.js): stat + sort by mtime
+        // first, then read summaries for only the 15 newest transcripts.
+        items = await listSessionSummaries(projectDir, { limit: 15 });
+      }
 
       if (items.length === 0) {
-        await sendReply('No sessions found.');
+        await sendReply(`No ${agentLabel(selectedAgent)} sessions found for this workdir.`);
         break;
       }
 
@@ -4166,8 +4973,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
       }).join('\n');
 
-      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse /resume <number> or /resume <id> to resume.`;
-      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume &lt;number&gt;</code> or <code>/resume &lt;id&gt;</code> to resume.</i>`;
+      const agentFlag = `--${selectedAgent}`;
+      const plainText = `${agentLabel(selectedAgent)} sessions for ${workdir}:\n\n${plainList}\n\nUse /resume ${agentFlag} <number> or /resume ${agentFlag} <id> to resume.`;
+      const html = `<b>${escapeHtml(agentLabel(selectedAgent))} sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume ${agentFlag} &lt;number&gt;</code> or <code>/resume ${agentFlag} &lt;id&gt;</code> to resume.</i>`;
 
       await sendHtml(plainText, html);
       break;
@@ -4176,16 +4984,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     case '!help': {
       const plainHelp =
         `Available commands:\n\n` +
-        `/start — Start a new session (creates a new room)\n` +
-        `/start <workdir> — Start in a specific directory\n` +
+        `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
+        `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
         `/stop — Stop the current session\n` +
         `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
-        `/resume <n> — Resume session #n from /sessions list\n` +
-        `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
-        `/sessions — List all past sessions\n` +
-        `/workdir <path> — Start session in a different directory (--browser also accepted)\n` +
+        `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
+        `/sessions [--claude|--codex] — List past sessions for an agent\n` +
+        `/workdir [--claude|--codex] <path> — Start a session in a different directory\n` +
         `/status — Show current session info\n` +
+        `/agent — Show the current agent\n` +
+        `/switch <claude|codex> — Hand this conversation to the other agent\n` +
         `/working — Toggle tool call visibility\n` +
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
@@ -4200,11 +5009,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
-        `While Claude is working:\n` +
+        `While the agent is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n` +
-        `  !esc — cancel claude's current turn without killing the session\n\n` +
-        `Send any other text to chat with Claude Code.\n` +
+        `  !esc — cancel the current turn without killing the session\n\n` +
+        `Send any other text to chat with the selected coding agent.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
       const cmdGroup = (title, cmds) => {
@@ -4214,18 +5023,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const htmlHelp =
         cmdGroup('Sessions', [
-          ['/start', 'Start a new session (creates a new room)'],
-          ['/start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
+          ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
           ['/stop', 'Stop the current session'],
           ['/restart', 'Stop and immediately resume the session (--browser also accepted)'],
-          ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
-          ['/resume &lt;id&gt;', 'Resume session by ID prefix (--browser also accepted)'],
-          ['/sessions', 'List all past sessions'],
-          ['/workdir &lt;path&gt;', 'Start session in a different directory (--browser also accepted)'],
+          ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
+          ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
+          ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
         ]) +
         cmdGroup('Info', [
           ['/status', 'Show current session info'],
+          ['/agent', 'Show the current coding agent'],
+          ['/switch &lt;claude|codex&gt;', 'Hand this conversation to the other coding agent'],
           ['/working', 'Toggle tool call visibility'],
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
@@ -4242,9 +5052,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<b>Tips</b><ul>` +
         `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
-        `<li>Messages are queued automatically while Claude is working</li>` +
+        `<li>Messages are queued automatically while the agent is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li><code>!esc</code> — cancel claude's current turn without killing the session</li>` +
+        `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -4252,8 +5062,56 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!agent': {
+      const session = sessions.get(roomId);
+      const arg = normalizeAgent(parts[1]);
+      if (!session || !session.alive) {
+        await sendReply(`Default agent: ${agentLabel(DEFAULT_AGENT)}\n\nStart one with /start --codex or /start --claude.`);
+        break;
+      }
+      if (!parts[1]) {
+        await sendReply(`Agent: ${agentLabel(session.agent)}\n\nUse /switch ${otherAgent(session.agent)} to hand this conversation to ${agentLabel(otherAgent(session.agent))}.`);
+        break;
+      }
+      if (!arg) {
+        await sendReply('Usage: /agent [claude|codex]');
+        break;
+      }
+      if (arg === session.agent) {
+        await sendReply(`Already using ${agentLabel(session.agent)}.`);
+        break;
+      }
+      await sendReply(`Use /switch ${arg} to hand this conversation from ${agentLabel(session.agent)} to ${agentLabel(arg)}.`);
+      break;
+    }
+
+    case '!switch': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (!parts[1]) {
+        await sendReply(
+          `Currently using ${agentLabel(session.agent)}.\n\nUsage: /switch ${otherAgent(session.agent)}`,
+        );
+        break;
+      }
+      if (parts.length > 2) {
+        await sendReply('Usage: /switch <claude|codex>');
+        break;
+      }
+      const target = normalizeAgent(parts[1].replace(/^--/, ''));
+      await switchAgentSession(roomId, target, { sendReply });
+      break;
+    }
+
     case '!mcp': {
       const session = sessions.get(roomId);
+      if (session?.agent === AGENT_CODEX) {
+        await sendReply('Codex programmatic sessions use MCP servers from the local Codex config. Live MCP status is not included in codex exec JSON events.');
+        break;
+      }
       if (session?.initData?.mcp_servers) {
         const servers = session.initData.mcp_servers;
         const plainList = servers.map(s => {
@@ -4318,8 +5176,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extra = session.initData
         ? `\nClaude Code: v${session.initData.claude_code_version || '(unknown)'}\nFast mode: ${session.initData.fast_mode_state || 'off'}`
         : '';
-      const currentLine = current ? `Current model: ${current}` : 'Current model: (appears after the first reply)';
-      if (session.iv) {
+      const currentLine = current
+        ? `Current model: ${current}`
+        : (session.agent === AGENT_CODEX ? 'Current model: Codex config default' : 'Current model: (appears after the first reply)');
+      if (session.agent === AGENT_CODEX) {
+        await sendReply(`${currentLine}\n\nType /model <model-id> to set the model for future Codex turns, or /model default to return to your Codex config default.`);
+      } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
         // auto-started sessions) — never claim "needs interactive mode" here.
@@ -4350,6 +5212,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
         await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Mode: programmatic (codex exec --json). Interactive Codex mode is not part of this first integration.');
         break;
       }
       const currentInteractive = !!session.iv;
@@ -4432,6 +5298,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Start a session to set the effort level.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Codex effort switching is not exposed by this first programmatic integration. Set model_reasoning_effort in your Codex config if needed.');
+        break;
+      }
       const arg = parts[1];
       if (arg) {
         switchEffortInSession(session, arg, sendReply);
@@ -4464,6 +5334,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply(`Codex exec does not report monetary cost.\nTurns: ${session.turnCount}\nUse /usage for token counts.`);
+        break;
+      }
       const cost = session.totalUsage.cost_usd;
       const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
       const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
@@ -4489,17 +5363,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Input: ${u.input_tokens.toLocaleString()}\n` +
         `Output: ${u.output_tokens.toLocaleString()}\n` +
         `Cache read: ${u.cache_read.toLocaleString()}\n` +
-        `Cache create: ${u.cache_create.toLocaleString()}\n` +
-        `Turns: ${session.turnCount}\n` +
-        `Cost: $${u.cost_usd.toFixed(4)}`;
+        (session.agent === AGENT_CODEX ? '' : `Cache create: ${u.cache_create.toLocaleString()}\n`) +
+        `Turns: ${session.turnCount}` +
+        (session.agent === AGENT_CODEX ? '' : `\nCost: $${u.cost_usd.toFixed(4)}`);
       const htmlUsage =
         `<b>Token Usage</b><table>` +
         `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
         `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
         `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
-        `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>`) +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>`) +
         `</table>`;
       await sendHtml(plainUsage, htmlUsage);
       break;
@@ -4511,7 +5385,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // so shell out to `claude -p "/usage"` and let Claude Code report them.
       // This is a global query — no active session required.
       try {
-        const cwd = sessions.get(roomId)?.workdir || DEFAULT_WORKDIR;
+        const active = sessions.get(roomId);
+        if (active?.agent === AGENT_CODEX) {
+          await sendReply('Codex subscription limits are not exposed by codex exec JSON output.');
+          break;
+        }
+        const cwd = active?.workdir || DEFAULT_WORKDIR;
         const raw = await fetchUsageLimitsText(cwd);
         const parsed = parseUsageLimits(raw);
         const { plain, html } = formatLimits(parsed, raw);
@@ -4526,6 +5405,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
         await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Codex exec does not include an authoritative tool inventory in its JSON event stream. Tools come from the installed Codex CLI, sandbox, skills, and local MCP configuration.');
         break;
       }
       if (!session.initData?.tools) {
@@ -4712,7 +5595,7 @@ async function journalRouteTextToSession(session, body) {
     // Not a valid selector — do NOT type it into the still-open menu (same
     // PTY-desync risk the Matrix path guards against). Notice instead of
     // silently dropping it.
-    journalPublishNotice(session.claudeSessionId,
+    journalPublishNotice(journalConvoIdFor(session),
       "That doesn't look like one of the options. Reply with the option number shown, or use the session's Matrix room to send !esc and cancel the menu.");
     return;
   }
@@ -4872,9 +5755,10 @@ function journalRoutePromptReply(session, { choice, text }) {
       if (resolved) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
+          if (session.iv.respondToPrompt(resp) !== true) return null;
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
-          session.iv.respondToPrompt(resp);
+          recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
           return resolved.option.label;
         }
       }
@@ -4889,9 +5773,14 @@ function journalRoutePromptReply(session, { choice, text }) {
       const opt = p.options[idx];
       const ftResponse = p.kind === 'arrow-menu' ? { kind: 'arrow-menu', key: String(idx) } : { kind: p.kind, key: opt.key };
       const freeText = text.trim();
+      const dispatched = sendDelayedPromptAnswer(session, {
+        response: ftResponse,
+        text: freeText,
+        onDelivered: () => recordUserAnswer(session, freeText, { mirrorToJournal: false }),
+        onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
+      });
+      if (!dispatched) return null;
       session.pendingInteractivePrompt = null;
-      session.iv.respondToPrompt(ftResponse);
-      setTimeout(() => { if (session.iv && session.iv.alive) session.iv.sendText(freeText); }, 250);
       return freeText;
     }
     return null;
@@ -4934,7 +5823,7 @@ function journalOnText(session, body, { username }) {
   // thrown/rejected dispatch can never crash the consumer.
   journalRouteTextToSession(session, body).catch((e) => {
     console.warn(`[journal-input] routing text to session failed: ${e.message}`);
-    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your message: ${e.message}`);
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your message: ${e.message}`);
   });
 }
 
@@ -5048,12 +5937,12 @@ function journalOnPromptReply(session, answer, { username }) {
     label = journalRoutePromptReply(session, answer);
   } catch (e) {
     console.warn(`[journal-input] routing prompt_reply failed: ${e.message}`);
-    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your answer: ${e.message}`);
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your answer: ${e.message}`);
     return;
   }
   if (label == null) {
-    console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${session.claudeSessionId}`);
-    journalPublishNotice(session.claudeSessionId, "Nothing to answer right now — there's no open prompt in this session.");
+    console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${journalConvoIdFor(session)}`);
+    journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
   journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
@@ -5127,7 +6016,7 @@ async function journalHandleControlCommand(body) {
 function journalResumeConvo(convoId) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
-    if (!prev || prev.sessionId !== convoId) continue;
+    if (!prev || (prev.journalConvoId !== convoId && prev.sessionId !== convoId)) continue;
     const existing = sessions.get(roomId);
     // A live session in this room under a DIFFERENT claude session id means
     // this convo is stale history (the room has moved on) — don't hijack it.
@@ -5196,7 +6085,8 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
-  if (session && session.claudeSessionId) journalInputConsumer.evictConvo(session.claudeSessionId);
+  const convoId = journalConvoIdFor(session);
+  if (convoId) journalInputConsumer.evictConvo(convoId);
 }
 
 // Plan approval for the `build` keyword — the Matrix handler's original
@@ -5299,24 +6189,38 @@ async function approvePlanBuild(session, { sendHtml }) {
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
-  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
+  const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
+  const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
+  const activeState = getPersistedAgentState(prev, activeAgent, history.length);
+  const resumeSessionId = activeState.sessionId;
+  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, resumeSessionId, {
+    agent: activeAgent,
+    model: activeState.model,
+    interactive: activeAgent === AGENT_CLAUDE
+      ? activeState.interactiveMode
+      : undefined,
+    mcpExtras: activeState.mcpExtras,
+    journalConvoId: prev.journalConvoId,
+  });
   newSession.originRoomId = prev.originRoomId || null;
   newSession.firstMessageCaptured = true;
-  newSession.chatHistory = prev.chatHistory || [];
+  newSession.chatHistory = history;
   newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
     sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  hydrateAgentState(newSession, prev);
 
-  const shortId = prev.sessionId.slice(0, 8);
-  const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
+  const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
+  const verb = resumeSessionId ? 'Auto-resuming' : 'Restoring';
+  const arNotice = notice('info', `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, `${verb} ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
   Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
-  enterResumeHold(newSession);
+  if (resumeSessionId) enterResumeHold(newSession);
   return newSession;
 }
 
@@ -5773,11 +6677,155 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
 
+function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {
+  const history = Array.isArray(session.chatHistory) ? session.chatHistory : [];
+  const state = getPersistedAgentState(persisted, session.agent, history.length);
+  const cursor = normalizeHistoryCursor(state.historyCursor, history.length);
+  session._agentHistoryCursor = cursor;
+  session.totalUsage = { ...session.totalUsage, ...state.totalUsage };
+  session.turnCount = state.turnCount;
+  session._pendingAgentHandoff = null;
+  if (cursor < history.length) {
+    session._pendingAgentHandoff = buildAgentHandoffPrompt({
+      fromAgent,
+      toAgent: session.agent,
+      history,
+      startIndex: cursor,
+      summary: session.pinnedSummaryText,
+      workdir: session.workdir,
+    });
+  }
+  return state;
+}
+
+async function switchAgentSession(roomId, targetAgent, { sendReply }) {
+  const existing = sessions.get(roomId);
+  const decision = canSwitchAgent(existing, targetAgent);
+  if (!decision.ok) {
+    await sendReply(decision.message);
+    return null;
+  }
+
+  const target = decision.target;
+  const persisted = getPersistedSession(roomId) || {};
+  const history = Array.isArray(existing.chatHistory) ? existing.chatHistory : [];
+  const sourceCursor = Number.isFinite(existing._agentHistoryCursor)
+    ? existing._agentHistoryCursor
+    : history.length;
+  const sourceState = snapshotAgentState(existing, sourceCursor);
+  const targetState = getPersistedAgentState(persisted, target, history.length);
+  const agentSessions = mergeAgentStates(persisted.agentSessions, {
+    [existing.agent]: sourceState,
+    [target]: targetState,
+  });
+
+  if (targetState.sessionId) {
+    const conflict = [...sessions.entries()].find(([otherRoomId, session]) =>
+      otherRoomId !== roomId && session.alive && session.claudeSessionId === targetState.sessionId);
+    if (conflict) {
+      await sendReply(
+        `${agentLabel(target)} session ${targetState.sessionId.slice(0, 8)}… is active in another conversation. Stop it there before switching.`,
+      );
+      return null;
+    }
+  }
+
+  const stableConvoId = journalConvoIdFor(existing) || persisted.journalConvoId || randomUUID();
+  const targetOptions = {
+    agent: target,
+    // null is an explicit provider-local default and prevents createSession
+    // from falling back to the outgoing provider's legacy top-level model.
+    model: targetState.model,
+    mcpExtras: target === AGENT_CLAUDE ? targetState.mcpExtras : [],
+    journalConvoId: stableConvoId,
+    ...(target === AGENT_CLAUDE
+      ? { interactive: targetState.interactiveMode ?? INTERACTIVE_MODE }
+      : {}),
+  };
+
+  // Construct the incoming provider before tearing down the outgoing one so
+  // a synchronous spawn/configuration failure leaves the current session
+  // usable. The new process receives no prompt until the user sends again.
+  let next;
+  try {
+    next = createSession(roomId, existing.workdir, targetState.sessionId, targetOptions);
+  } catch (error) {
+    sessions.set(roomId, existing);
+    await sendReply(`Could not switch to ${agentLabel(target)}: ${error.message}`);
+    return null;
+  }
+
+  journalStreamClear(existing);
+  killSession(existing);
+
+  next.originRoomId = existing.originRoomId;
+  next.firstMessageCaptured = true;
+  next.sendCallback = existing.sendCallback;
+  next.sendHtml = existing.sendHtml;
+  next.sendButtonMessage = existing.sendButtonMessage;
+  next.showWorking = existing.showWorking;
+  next.showBashOutput = existing.showBashOutput;
+  next.chatHistory = history;
+  next.pinnedSummaryText = existing.pinnedSummaryText;
+  next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next.journalConvoId = stableConvoId;
+  next._journalBuffer = existing._journalBuffer;
+  next._journalTitleHint = existing._journalTitleHint;
+  next._journalState = existing._journalState;
+  next._journalActivityState = existing._journalActivityState;
+  next._journalConvoEstablished = existing._journalConvoEstablished;
+  next._agentSessions = agentSessions;
+  hydrateAgentState(next, { ...persisted, agentSessions }, existing.agent);
+  if (targetState.sessionId) enterResumeHold(next);
+
+  persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, {
+    agent: target,
+    agentSessions,
+    journalConvoId: stableConvoId,
+    chatHistory: history,
+    pinnedSummaryText: next.pinnedSummaryText || '',
+    pinnedSummaryEventId: next.pinnedSummaryEventId || null,
+    model: next.currentModel || null,
+    interactiveMode: target === AGENT_CLAUDE ? !!next.iv : undefined,
+    mcpExtras: next.mcpExtras,
+    totalUsage: next.totalUsage,
+    turnCount: next.turnCount,
+  });
+
+  const nativeState = targetState.sessionId
+    ? `Resumed its previous native session ${targetState.sessionId.slice(0, 8)}….`
+    : 'A native session will be created with your next message.';
+  const handoffState = next._pendingAgentHandoff
+    ? ` ${next._pendingAgentHandoff.toIndex - next._pendingAgentHandoff.fromIndex} unseen transcript message${next._pendingAgentHandoff.toIndex - next._pendingAgentHandoff.fromIndex === 1 ? '' : 's'} will be handed over with that message.`
+    : '';
+  await sendReply(`Switched from ${agentLabel(existing.agent)} to ${agentLabel(target)}. ${nativeState}${handoffState}`);
+  return next;
+}
+
 // Apply a /model switch for either mode. Interactive sessions type /model into
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
 // the model: picker button.
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+  if (session.agent === AGENT_CODEX) {
+    if (session.busy) {
+      sendReply('Finish or interrupt the current Codex turn before switching models.');
+      return;
+    }
+    const requested = String(arg || '').trim();
+    if (!requested || /\s/.test(requested)) {
+      sendReply('Usage: /model <model-id> (or /model default)');
+      return;
+    }
+    const model = requested.toLowerCase() === 'default' ? null : requested;
+    session.currentModel = model;
+    session.codex.model = model;
+    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
+    sendReply(model
+      ? `Codex model set to ${model}; it will apply on the next turn.`
+      : 'Codex model reset to the local config default; it will apply on the next turn.');
+    return;
+  }
   if (session.iv) {
     // Interactive: type /model into the live TUI. Not persisted by design —
     // the pick applies to the live session only (spec non-goal); a restart
@@ -5801,6 +6849,10 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
 function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+  if (session.agent === AGENT_CODEX) {
+    sendReply('Interactive Codex mode is not part of this first integration.');
+    return;
+  }
   const decision = planModeSwitch(session, wantInteractive);
   if (!decision.ok) {
     sendReply(decision.message);
@@ -5834,15 +6886,23 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // _journalDurableRef, so a late flush on the old session can't carry a stale
   // ref onto the new session's journal. No-op when nothing was streaming.
   journalStreamClear(existing);
-  killSession(existing);
+  killSession(existing, 'SIGTERM', { preserveQueue: true });
   const next = createSession(roomId, workdir, sessionId, {
+    agent: existing.agent,
     mcpExtras: existing.mcpExtras,
+    journalConvoId: existing.journalConvoId,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/
     // default model. An explicit override (e.g. /model in print mode) still
     // wins via the spread below.
-    model: existing.currentModel || undefined,
+    // Codex null means "use its config default" and must remain explicit;
+    // falling back to persisted.model can otherwise pick up Claude's model.
+    // Claude keeps the historical undefined fallback for a not-yet-observed
+    // live model so its persisted selection survives a TUI restart.
+    model: existing.agent === AGENT_CODEX
+      ? existing.currentModel
+      : (existing.currentModel || undefined),
     ...overrides,
   });
   next.sendCallback = sendReply;
@@ -5858,14 +6918,34 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.chatHistory = existing.chatHistory;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next._agentHistoryCursor = existing._agentHistoryCursor;
+  next._pendingAgentHandoff = existing._pendingAgentHandoff;
+  next._agentSessions = existing._agentSessions;
+  next.totalUsage = existing.totalUsage;
+  next.turnCount = existing.turnCount;
+  next._journalBuffer = existing._journalBuffer;
+  next._journalTitleHint = existing._journalTitleHint;
+  next._journalState = existing._journalState;
+  next._journalActivityState = existing._journalActivityState;
+  next._journalConvoEstablished = existing._journalConvoEstablished;
   if (sessionId) {
-    persistSession(roomId, sessionId, workdir, originRoomId);
+    persistSession(roomId, sessionId, workdir, originRoomId, {
+      agentSessions: existing._agentSessions,
+      journalConvoId: existing.journalConvoId,
+    });
   }
   // A resumed interactive TUI isn't ready for input for a few seconds; hold
   // the first post-switch message until it is, so it isn't typed into a
   // still-loading TUI and dropped. No-op for print sessions (enterResumeHold
   // returns early when there's no PTY).
   enterResumeHold(next);
+  // A forced Codex restart may have interrupted a turn with user messages
+  // already queued behind it. They belong to the logical conversation, not
+  // the killed child, so dispatch them through the idle replacement now.
+  if (next.agent === AGENT_CODEX && next.queuedMessages?.length) {
+    clearQueueNotifications(next);
+    flushPendingSessionQueue(next);
+  }
   return next;
 }
 
@@ -5877,6 +6957,20 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
 // never delivers one (wedged process), so the bridge stops queueing
 // messages behind a busy flag nothing will ever clear.
 async function printModeInterrupt(session, sendReply) {
+  if (session.agent === AGENT_CODEX) {
+    if (!session.alive || !session.busy || !session.codex?.child) {
+      await sendReply('Nothing to interrupt — Codex is idle.');
+      return;
+    }
+    session._codexInterrupted = true;
+    if (session.codex.interrupt('SIGINT')) {
+      await sendReply('⏹ Interrupt sent — waiting for Codex to stop this turn.');
+    } else {
+      session._codexInterrupted = false;
+      await sendReply('Could not interrupt the Codex turn.');
+    }
+    return;
+  }
   if (!session.proc || !session.alive) {
     await sendReply('No claude process to interrupt.');
     return;
@@ -5918,7 +7012,7 @@ function clearPendingInterrupt(session) {
   }
 }
 
-function killSession(session, signal = 'SIGTERM') {
+function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
@@ -5938,7 +7032,22 @@ function killSession(session, signal = 'SIGTERM') {
 
   if (!session.alive) return;
   try {
-    if (session.iv) session.iv.kill(signal);
+    session.alive = false;
+    if (session.agent === AGENT_CODEX && session.codex) {
+      // Codex's adapter has no long-lived idle process whose close handler can
+      // normalize bridge state. Finish an active turn synchronously before a
+      // restart copies state into its replacement; discard partial output and
+      // never flush queued work into a session being killed.
+      if (!session._codexTurnFinished) {
+        finishCodexTurn(session, {
+          usage: session._codexCompletedUsage,
+          discardOutput: true,
+          preserveQueue,
+        });
+      }
+      session.codex.kill(signal);
+    }
+    else if (session.iv) session.iv.kill(signal);
     else if (session.proc) session.proc.kill(signal);
   } catch (e) {
     debug(`killSession error: ${e.message}`);
@@ -5961,6 +7070,16 @@ function startIdleReaper() {
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
       session._autoStopped = true;
       killSession(session, 'SIGTERM');
+      // Claude's persistent child close handler performs this cleanup. An
+      // idle Codex logical session normally has no child between turns, so
+      // there will be no close event to remove it from the live map.
+      if (session.agent === AGENT_CODEX) {
+        sessions.delete(roomId);
+        journalStreamClear(session);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
+      }
     }
   }, SESSION_IDLE_CHECK_MS).unref();
 }

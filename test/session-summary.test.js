@@ -323,6 +323,22 @@ describe('index.js resume/sessions paths — no sync fs calls (source inspection
     expect(block).not.toMatch(/\b(?:readdirSync|statSync|existsSync)\b/);
   });
 
+  it('the !resume case restores and re-persists the complete provider handoff state', () => {
+    const block = commandBlock("case '!resume':", "case '!workdir':");
+
+    expect(block).toContain('findPersistedAgentSession(selectedAgent, resumeSessionId)');
+    expect(block).not.toMatch(/Object\.values\(loadPersistedSessions\(\)\)\.find\(e => e\.sessionId/);
+    expect(block).toContain('codexMatches.length + claudeMatches.size > 1');
+    expect(block).toContain('await rejectAmbiguousResume()');
+    expect(block).toContain('journalConvoIdFor(activeSession) === resumeConvoId');
+    expect(block).toContain('agentSessions: inheritedAgentSessions');
+    expect(block).toContain('journalConvoId: resumePersisted?.journalConvoId');
+    expect(block).toContain('journalConvoId: session.journalConvoId');
+    expect(block).toContain('model: resumeState.model');
+    expect(block).toContain('interactive: resumeState.interactiveMode');
+    expect(block).toContain('mcpExtras: effectiveResumeExtras');
+  });
+
   it("the !sessions case runs no readdirSync/statSync/existsSync", () => {
     const block = commandBlock("case '!sessions':", "case '!help':");
     expect(block).not.toMatch(/\b(?:readdirSync|statSync|existsSync)\b/);
