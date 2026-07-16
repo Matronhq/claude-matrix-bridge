@@ -34,6 +34,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -50,6 +51,7 @@ import { sendPrintInterrupt } from './lib/print-interrupt.js';
 import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createRecentFolders } from './lib/recent-folders.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -127,6 +129,9 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+// Durable folder history for the picker (`recent_folders` RPC) — outlives
+// the session records above, which stale-resume cleanup deletes.
+const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -375,7 +380,17 @@ function savePersistedSessions(data) {
   }
 }
 
+// Folder history store, seeded once per boot from whatever the session
+// store still knows — after that, folders survive on their own even when
+// their session records are deleted.
+const recentFolders = createRecentFolders({ file: RECENT_FOLDERS_FILE });
+recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
+  path: rec?.workdir,
+  lastUsed: rec?.lastUsed,
+})));
+
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
+  recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
   const existing = data[String(roomId)] || {};
   // Auto-carry session-scoped fields (mcpExtras) from the live session if the
@@ -529,6 +544,7 @@ const journalRpcHandler = createRpcRequestHandler({
     journalEvictConvoInput(session);
   },
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
+  listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
   expandHome,
   log: console,
@@ -608,9 +624,16 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
-function journalSeedTitle(session) {
+// opts.incomingHint: the title carried across a restart/resume (see
+// seedJournalTitle) so a respawn adopts the prior good title instead of
+// re-seeding the repo basename over it. opts.reattaching: this convo already
+// exists server-side (a journalConvoId was supplied), so suppress the workdir
+// seed entirely — it could only clobber the earned title.
+function journalSeedTitle(session, { incomingHint, reattaching = false } = {}) {
   return seedJournalTitle(session, {
     workdir: session.workdir,
+    incomingHint,
+    reattaching,
     upsertConvo: journalUpsertConvo,
     warn: (m) => DEBUG && console.warn(m),
   });
@@ -935,7 +958,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(codexSession);
+    journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return codexSession;
   }
   const interactive = resolveInteractive({
@@ -945,7 +968,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
   if (interactive) {
     const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(ivSession);
+    journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return ivSession;
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -1149,6 +1172,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -1215,7 +1241,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   sessions.set(roomId, session);
-  journalSeedTitle(session);
+  journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
   return session;
 }
 
@@ -1677,6 +1703,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -2442,28 +2471,6 @@ function resolveQuestionAnswer(session, text) {
 }
 
 // --- Claude Event Handler ---
-
-// Format a subagent tool_use block as a plain journal-text body for the child
-// convo. Returns null for tools we don't surface (Read/Glob/Grep/Bash/etc.) to
-// keep the child convo readable — mirrors the parent's "key event" gating. No
-// 🔀[label] prefix: the child conversation IS the subagent, so its label lives
-// in the convo title, not on every line.
-function formatSubagentToolBody(toolName, input) {
-  if (toolName === 'WebSearch' && input.query) return `🌐 ${input.query}`;
-  if (toolName === 'WebFetch' && input.url) return `🌐 ${input.url}`;
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const desc = (input.description || input.prompt || '').slice(0, 80);
-    return `🔀 Nested subtask: ${desc}`;
-  }
-  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
-    const lines = input.todos.map(t => {
-      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-      return `${icon} ${t.content || t.text || ''}`;
-    });
-    return `📋 Todos:\n${lines.join('\n')}`;
-  }
-  return null;
-}
 
 // Construct + wire a session's subagent watcher and its child-convo tracker.
 // The tracker publishes each discovered subagent as its own child conversation
@@ -4355,14 +4362,22 @@ function safeMediaFilename(name) {
 // claude. Audio is NOT handled here — the caller surfaces transcription
 // progress itself, so it runs transcribeAudio directly. `isImage` selects the
 // image branch by msgtype rather than mime — an image-mime file still falls
-// through the file branch's inline-image sub-case. `ivFilename`/`ivCaption`
-// feed the iv upload annotation; `workdirName` names the SDK-mode save.
-// Returns { blocks, ivHandled } — ivHandled true means the iv branch already
-// folded any caption in, so the caller must not append it again.
+// through the file branch's inline-image sub-case. `ivFilename` names the iv
+// upload; `workdirName` names the SDK-mode save.
+//
+// `caption` is what the user typed alongside the attachment in the composer.
+// BOTH modes fold it in, each in its own idiom: iv mode passes it to the
+// upload annotation (caption above the path), SDK mode leads with it as its
+// own text block. It used to be `ivCaption`, hardcoded `null` by the only
+// caller — so a caption reached this function from nowhere and left for
+// nowhere, and claude never saw one. `ivHandled` went the same way: it was
+// returned to tell a caller not to double-append the caption, but no caller
+// ever read it.
+//
 // `inline` is an optional prepareInlineImage decision governing the base64
 // image block only (downscaled copy / skip); the buffer written to disk and
 // the pending-media mirror always carry the full-resolution original.
-function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName, inline }) {
+function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
@@ -4371,7 +4386,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
     fs.writeFileSync(savePath, buffer);
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption: ivCaption }) });
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
     // than calling journalMirrorUserMedia now) is what stops a queued
@@ -4382,6 +4397,11 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
     return { blocks, ivHandled: true };
   }
+  // SDK mode: lead with the caption so claude reads the user's words before
+  // the "Image saved to …" bookkeeping and the image itself — the order a
+  // person would say it in. Everything below appends to the same `blocks`
+  // array, i.e. the same single user turn.
+  if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
     // Save image to workdir
     const imgPath = deduplicateFilename(session.workdir, workdirName);
@@ -5904,7 +5924,7 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
-  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
     const safeName = safeMediaFilename(name);
     // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
     // so don't burn a decode there). The original buffer still goes to disk.
@@ -5919,7 +5939,7 @@ const journalMediaRouter = createJournalMediaRouter({
     }
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
-      ivFilename: safeName, ivCaption: null, workdirName: safeName, inline,
+      ivFilename: safeName, caption, workdirName: safeName, inline,
     }).blocks;
   },
   injectText: (session, text) => sendTextToSession(session, text),
@@ -6964,6 +6984,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     journalConvoId: existing.journalConvoId,
+    // Carry the good title across the swap so the re-seed adopts it instead of
+    // clobbering it with the repo basename (title-revert bug).
+    journalTitleHint: existing._journalTitleHint,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/
