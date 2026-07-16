@@ -6079,9 +6079,10 @@ async function journalHandleControlCommand(body) {
 // claude session id, so scan persisted sessions for it and respawn through
 // the SAME helper the Matrix path uses (resumePersistedSession — hoisted,
 // defined next to the Matrix handler below). Returns the new session for the
-// router to route the triggering text into (delivery is safe: sendToSession
-// holds input in _resumeOutbox until the resumed TUI is ready), or null to
-// fall back to the unknown-convo notice.
+// router to route the triggering text or media into (delivery is safe:
+// sendToSession holds input in _resumeOutbox until the resumed TUI is ready,
+// and print mode's stdin buffers), or null to fall back to the unknown-convo
+// notice.
 function journalResumeConvo(convoId) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
