@@ -608,9 +608,16 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
-function journalSeedTitle(session) {
+// opts.incomingHint: the title carried across a restart/resume (see
+// seedJournalTitle) so a respawn adopts the prior good title instead of
+// re-seeding the repo basename over it. opts.reattaching: this convo already
+// exists server-side (a journalConvoId was supplied), so suppress the workdir
+// seed entirely — it could only clobber the earned title.
+function journalSeedTitle(session, { incomingHint, reattaching = false } = {}) {
   return seedJournalTitle(session, {
     workdir: session.workdir,
+    incomingHint,
+    reattaching,
     upsertConvo: journalUpsertConvo,
     warn: (m) => DEBUG && console.warn(m),
   });
@@ -935,7 +942,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(codexSession);
+    journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return codexSession;
   }
   const interactive = resolveInteractive({
@@ -945,7 +952,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
   if (interactive) {
     const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(ivSession);
+    journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return ivSession;
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -1149,6 +1156,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -1215,7 +1225,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   sessions.set(roomId, session);
-  journalSeedTitle(session);
+  journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
   return session;
 }
 
@@ -1677,6 +1687,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -6974,6 +6987,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     journalConvoId: existing.journalConvoId,
+    // Carry the good title across the swap so the re-seed adopts it instead of
+    // clobbering it with the repo basename (title-revert bug).
+    journalTitleHint: existing._journalTitleHint,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/
