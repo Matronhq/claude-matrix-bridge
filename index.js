@@ -50,6 +50,7 @@ import { sendPrintInterrupt } from './lib/print-interrupt.js';
 import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createRecentFolders } from './lib/recent-folders.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -127,6 +128,9 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+// Durable folder history for the picker (`recent_folders` RPC) — outlives
+// the session records above, which stale-resume cleanup deletes.
+const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -375,7 +379,17 @@ function savePersistedSessions(data) {
   }
 }
 
+// Folder history store, seeded once per boot from whatever the session
+// store still knows — after that, folders survive on their own even when
+// their session records are deleted.
+const recentFolders = createRecentFolders({ file: RECENT_FOLDERS_FILE });
+recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
+  path: rec?.workdir,
+  lastUsed: rec?.lastUsed,
+})));
+
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
+  recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
   const existing = data[String(roomId)] || {};
   // Auto-carry session-scoped fields (mcpExtras) from the live session if the
@@ -529,6 +543,7 @@ const journalRpcHandler = createRpcRequestHandler({
     journalEvictConvoInput(session);
   },
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
+  listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
   expandHome,
   log: console,
