@@ -490,11 +490,11 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
 
 // Auto-resume seam: the idle reaper silently kills sessions assuming "the
 // next user message auto-resumes" — true for Matrix room messages, but the
-// journal path used to dead-end with "no longer active". A text event for an
-// unknown convo now gives the caller a chance to respawn the session (from
-// persisted state) before declaring it dead. prompt_reply is NOT resumed:
-// the pending prompt died with the process, so an answer has nothing valid
-// to land on.
+// journal path used to dead-end with "no longer active". A text or media
+// (file/image) event for an unknown convo now gives the caller a chance to
+// respawn the session (from persisted state) before declaring it dead.
+// prompt_reply is NOT resumed: the pending prompt died with the process, so
+// an answer has nothing valid to land on.
 describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeSessionForConvo)', () => {
   function makeDeps(overrides = {}) {
     return {
@@ -776,12 +776,54 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
   });
 
-  it('media for an unknown/dead session notices and drops, never routes (media is not auto-resumed)', () => {
+  it('media for an unknown convo auto-resumes the session and routes the media into it, with no unknown-convo notice', () => {
+    // Same contract as text: a reaped-but-resumable convo must not dead-end
+    // with "no longer active" just because the frame is a file/image —
+    // delivery after the wake is safe (print mode's stdin buffers; iv mode's
+    // resume hold parks input until the TUI is ready).
+    const resumed = { claudeSessionId: 'convo-1', resumed: true };
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => resumed) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    const [session, media] = deps.routeMediaToSession.mock.calls[0];
+    expect(session).toBe(resumed);
+    expect(media.blobRef).toBe('blob-1');
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('an image frame for an unknown convo auto-resumes too (both MEDIA_TYPES, top-level blob_ref fallback included)', () => {
+    const resumed = { claudeSessionId: 'convo-1', resumed: true };
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => resumed) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'image', blob_ref: 'top-img', payload: { content_type: 'image/png', name: 'shot.png' } }));
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledTimes(1);
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeMediaToSession.mock.calls[0][1].blobRef).toBe('top-img');
+  });
+
+  it('a media frame with no blob_ref never triggers a resume (nothing to fetch, no session spawned)', () => {
     const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'x' })) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'file', payload: { content_type: 'application/pdf', name: 'x.pdf' } }));
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+  });
+
+  it('media resume returning null falls back to the unknown-convo notice, never routes', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => null) });
     const consumer = createJournalInputConsumer(deps);
     consumer(fileFrame());
     expect(deps.routeMediaToSession).not.toHaveBeenCalled();
-    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'file', username: 'dan' });
+  });
+
+  it('media for an unknown convo without a resume seam notices and drops as before', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
     expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'file', username: 'dan' });
   });
 
