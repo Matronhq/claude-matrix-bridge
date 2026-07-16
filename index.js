@@ -34,6 +34,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -2455,28 +2456,6 @@ function resolveQuestionAnswer(session, text) {
 }
 
 // --- Claude Event Handler ---
-
-// Format a subagent tool_use block as a plain journal-text body for the child
-// convo. Returns null for tools we don't surface (Read/Glob/Grep/Bash/etc.) to
-// keep the child convo readable — mirrors the parent's "key event" gating. No
-// 🔀[label] prefix: the child conversation IS the subagent, so its label lives
-// in the convo title, not on every line.
-function formatSubagentToolBody(toolName, input) {
-  if (toolName === 'WebSearch' && input.query) return `🌐 ${input.query}`;
-  if (toolName === 'WebFetch' && input.url) return `🌐 ${input.url}`;
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const desc = (input.description || input.prompt || '').slice(0, 80);
-    return `🔀 Nested subtask: ${desc}`;
-  }
-  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
-    const lines = input.todos.map(t => {
-      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-      return `${icon} ${t.content || t.text || ''}`;
-    });
-    return `📋 Todos:\n${lines.join('\n')}`;
-  }
-  return null;
-}
 
 // Construct + wire a session's subagent watcher and its child-convo tracker.
 // The tracker publishes each discovered subagent as its own child conversation
