@@ -68,4 +68,19 @@ describe('attachSpawnErrorHandler', () => {
     });
     expect(() => proc.emit('error', new Error('boom'))).not.toThrow();
   });
+
+  // index.js keeps ALL session cleanup (alive=false, teardown, the 3-restart
+  // cap) in proc.on('close') and relies on Node emitting 'close' even when
+  // spawn itself fails. Pin that runtime contract with a real failed spawn —
+  // if a future Node stops emitting 'close' after a spawn 'error', sessions
+  // would leak exactly as PR #145's review feared.
+  it("real failed spawn emits 'close' after 'error'", async () => {
+    const { spawn } = await import('node:child_process');
+    const proc = spawn('matron-bridge-no-such-binary', [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    attachSpawnErrorHandler(proc, { notify: () => {}, log: () => {} });
+    const events = [];
+    proc.on('error', () => events.push('error'));
+    await new Promise((resolve) => proc.on('close', () => { events.push('close'); resolve(); }));
+    expect(events).toEqual(['error', 'close']);
+  });
 });
