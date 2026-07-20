@@ -1,4 +1,5 @@
 import express from 'express';
+import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
@@ -183,28 +184,20 @@ app.get('/view', async (req, res) => {
   }
 });
 
-// Per-IP sliding-window limiter (CodeQL js/missing-rate-limiting): bounds
-// the disk reads a token holder — or a token guesser — can trigger. In-
-// memory is fine here: one viewer process, restart resets are harmless.
-const DOWNLOAD_WINDOW_MS = 60_000;
-const DOWNLOAD_MAX_PER_WINDOW = parseInt(process.env.DOWNLOAD_RATE_LIMIT || '30', 10);
-const downloadHits = new Map();
-function downloadRateLimited(ip) {
-  const now = Date.now();
-  if (downloadHits.size > 1000) {
-    for (const [k, v] of downloadHits) {
-      if (!v.some(t => now - t < DOWNLOAD_WINDOW_MS)) downloadHits.delete(k);
-    }
-  }
-  const hits = (downloadHits.get(ip) || []).filter(t => now - t < DOWNLOAD_WINDOW_MS);
-  const limited = hits.length >= DOWNLOAD_MAX_PER_WINDOW;
-  if (!limited) hits.push(now);
-  downloadHits.set(ip, hits);
-  return limited;
-}
+// Bounds the disk reads a token holder — or a token guesser — can trigger.
+// In-memory store is fine here: one viewer process, restart resets are
+// harmless. Behind the Cloudflare tunnel every request shares the loopback
+// IP, so this is effectively a global budget — right shape for a single-
+// user deployment.
+const downloadLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.DOWNLOAD_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
 
-app.get('/download', async (req, res) => {
-  if (downloadRateLimited(req.ip)) return res.status(429).send('Too many requests');
+app.get('/download', downloadLimiter, async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
